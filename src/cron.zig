@@ -1646,9 +1646,10 @@ pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
 }
 
 /// Format a Unix timestamp (seconds since epoch) into a human-readable string.
-/// Returns: "Mon Mar 02 2026 12:39:00 GMT+0000"
+/// Returns: "Mon Mar 02 2026 12:39:00 UTC"
 fn formatUnixTimestamp(secs: i64, buf: []u8) []const u8 {
     if (buf.len < 30) return "buffer too small";
+    if (secs < 0) return "invalid timestamp";
 
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
     const epoch_day = epoch_secs.getEpochDay();
@@ -1704,6 +1705,27 @@ test "parseDuration days" {
 
 test "parseDuration weeks" {
     try std.testing.expectEqual(@as(i64, 604800), try parseDuration("1w"));
+}
+
+test "formatUnixTimestamp formats known UTC timestamp" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Mon Mar 02 2026 14:00:00 UTC",
+        formatUnixTimestamp(1772460000, &buf),
+    );
+}
+
+test "formatUnixTimestamp formats unix epoch" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Thu Jan 01 1970 00:00:00 UTC",
+        formatUnixTimestamp(0, &buf),
+    );
+}
+
+test "formatUnixTimestamp rejects negative timestamp" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("invalid timestamp", formatUnixTimestamp(-1, &buf));
 }
 
 test "parseDuration seconds" {
