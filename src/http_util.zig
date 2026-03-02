@@ -109,7 +109,11 @@ fn curlRequestWithProxy(
         return error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
 
     const term = child.wait() catch {
         allocator.free(stdout);
@@ -184,7 +188,11 @@ pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]
         return error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
 
     const term = child.wait() catch {
         allocator.free(stdout);
@@ -270,7 +278,11 @@ pub fn curlPostWithStatus(
         return error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch return error.CurlWaitError;
@@ -353,7 +365,11 @@ fn curlGetWithProxyAndResolve(
 
     try child.spawn();
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
@@ -441,7 +457,11 @@ pub fn curlGetSSE(
         return error.CurlFailed;
     };
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
 
     const term = child.wait() catch {
         allocator.free(stdout);
