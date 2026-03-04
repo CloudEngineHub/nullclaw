@@ -113,7 +113,40 @@ Then:
 nullclaw --help
 ```
 
-### 3) Common commands
+### 3) Optional: WhatsApp Web bridge (whatsmeow)
+
+`channels.whatsapp_web` uses an external bridge process. This repository now
+ships a reference bridge at:
+
+`examples/whatsapp-web/whatsmeow-bridge/`
+
+Build and run:
+
+```bash
+cd examples/whatsapp-web/whatsmeow-bridge
+go mod tidy
+go build -o nullclaw-whatsmeow-bridge .
+NULLCLAW_ACCOUNT_ID=default \
+NULLCLAW_BRIDGE_ADDR=127.0.0.1:3301 \
+NULLCLAW_WHATSMEOW_DB="$HOME/.local/state/nullclaw/whatsmeow.db" \
+./nullclaw-whatsmeow-bridge
+```
+
+Bridge prerequisite: Go 1.25+ (required by current whatsmeow dependency tree).
+
+Then configure the channel with onboarding and restart nullclaw:
+
+```bash
+zig build -Doptimize=ReleaseSmall -Dchannels=all,whatsapp-web
+zig-out/bin/nullclaw onboard
+zig-out/bin/nullclaw service restart
+```
+
+Full instructions (pairing + systemd user service) are in:
+
+`examples/whatsapp-web/whatsmeow-bridge/README.md`
+
+### 4) Common commands
 
 ```bash
 
