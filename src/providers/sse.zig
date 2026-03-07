@@ -1,6 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const http_util = @import("../http_util.zig");
+const platform = @import("../platform.zig");
+const error_classify = @import("error_classify.zig");
+const verbose = @import("../verbose.zig");
 
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
@@ -74,6 +78,10 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    // Check verbose mode once at function start
+    const log_enabled = verbose.isVerbose();
+    const debug_log = std.log.scoped(.sse);
+
     // Build argv on stack (max 32 args)
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
@@ -130,18 +138,103 @@ pub fn curlStream(
         argc += 1;
     }
 
-    argv_buf[argc] = "-d";
-    argc += 1;
-    argv_buf[argc] = body;
+    // On Windows, command line length is limited to ~32767 chars.
+    // Use temp file for body to avoid NameTooLong error.
+    // Always use temp file on Windows for reliability.
+    const use_temp_file = builtin.os.tag == .windows or body.len > 2000;
+    var body_path_len: usize = 0;
+    var used_temp_file = false;
+
+    var body_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const body_arg: []const u8 = if (use_temp_file) blk: {
+        const tmp_dir_path = platform.getTempDir(allocator) catch
+            return error.TempDirNotFound;
+        defer allocator.free(tmp_dir_path);
+
+        var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
+            return error.TempDirNotFound;
+        defer tmp_dir.close();
+
+        const body_path = std.fmt.bufPrint(&body_path_buf, "{s}{s}sse_body_{d}.tmp", .{ tmp_dir_path, std.fs.path.sep_str, std.time.timestamp() }) catch
+            return error.PathTooLong;
+        body_path_len = body_path.len;
+
+        var tmp_file = tmp_dir.createFile(
+            body_path[tmp_dir_path.len + 1 ..],
+            .{ .truncate = true, .exclusive = false },
+        ) catch return error.TempFileCreateFailed;
+
+        tmp_file.writeAll(body) catch {
+            tmp_file.close();
+            return error.TempFileWriteFailed;
+        };
+        tmp_file.close();
+
+        used_temp_file = true;
+        if (log_enabled) {
+            debug_log.info("Using temp file for body: {s}, body_len={d}", .{ body_path, body.len });
+        }
+        // Verify file was written correctly
+        const verify_file = std.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
+        defer verify_file.close();
+        const verify_stat = verify_file.stat() catch return error.TempFileCreateFailed;
+        if (log_enabled) {
+            debug_log.info("Temp file size: {d} bytes", .{verify_stat.size});
+        }
+        if (comptime builtin.os.tag == .windows) {
+            for (body_path_buf[0..body_path_len]) |*c| {
+                if (c.* == '\\') c.* = '/';
+            }
+        }
+        break :blk try std.fmt.allocPrint(allocator, "@{s}", .{body_path_buf[0..body_path_len]});
+    } else body;
+
+    if (used_temp_file) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+    } else {
+        argv_buf[argc] = "-d";
+        argc += 1;
+    }
+    argv_buf[argc] = body_arg;
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
+
+    // Debug: log the curl command
+    if (log_enabled) {
+        debug_log.info("curl argc={d}, body_len={d}, used_temp_file={}, body_arg={s}", .{ argc, body.len, used_temp_file, body_arg });
+    }
+
+    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd_buf.deinit(allocator);
+    for (argv_buf[0..argc], 0..) |arg, i| {
+        if (i > 0) cmd_buf.append(allocator, ' ') catch {};
+        // Quote arguments that contain spaces or special chars for easy copy-paste
+        if (std.mem.indexOfAny(u8, arg, " \t\"'") != null or std.mem.startsWith(u8, arg, "@")) {
+            cmd_buf.append(allocator, '"') catch {};
+            cmd_buf.appendSlice(allocator, arg) catch {};
+            cmd_buf.append(allocator, '"') catch {};
+        } else {
+            cmd_buf.appendSlice(allocator, arg) catch {};
+        }
+    }
+    if (log_enabled) {
+        debug_log.info("curl command: {s}", .{cmd_buf.items});
+    }
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
+    if (log_enabled) {
+        debug_log.info("spawning curl process...", .{});
+    }
     try child.spawn();
+    if (log_enabled) {
+        const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
+        debug_log.info("curl process spawned, pid={d}", .{pid});
+    }
 
     // Read stdout line by line, parse SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -150,16 +243,59 @@ pub fn curlStream(
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
-    const file = child.stdout.?;
+    const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
+    var total_stdout: usize = 0;
 
     outer: while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
+        const n = stdout_file.read(&read_buf) catch |err| {
+            if (log_enabled) {
+                debug_log.info("stdout read error: {}", .{err});
+            }
+            break;
+        };
+        if (n == 0) {
+            if (log_enabled) {
+                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
+            }
+            break;
+        }
+        total_stdout += n;
+
+        if (log_enabled) {
+            debug_log.info("stdout read {d} bytes: {s}", .{ n, read_buf[0..n] });
+        }
+
+        // Check if this is JSON (starts with '{')
+        if (total_stdout == n and read_buf[0] == '{') {
+            if (log_enabled) {
+                debug_log.info("Detected JSON response, not SSE", .{});
+            }
+            // This is a JSON error, not SSE
+            const json_response = try allocator.dupe(u8, read_buf[0..n]);
+            defer allocator.free(json_response);
+            
+            // Try to classify the error
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                    return error_classify.kindToError(kind);
+                }
+            }
+            
+            // Return a meaningful error
+            const log = std.log.scoped(.sse);
+            log.err("Server returned JSON error: {s}", .{json_response});
+            return error.ServerError;
+        }
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
+                if (log_enabled) {
+                    debug_log.info("parsing SSE line: {s}", .{line_buf.items});
+                }
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -172,6 +308,9 @@ pub fn curlStream(
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
                     .done => {
+                        if (log_enabled) {
+                            debug_log.info("SSE stream done", .{});
+                        }
                         saw_done = true;
                         break :outer;
                     },
@@ -181,6 +320,10 @@ pub fn curlStream(
                 try line_buf.append(allocator, byte);
             }
         }
+    }
+
+    if (log_enabled) {
+        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
@@ -202,14 +345,33 @@ pub fn curlStream(
 
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
-        const n = file.read(&read_buf) catch break;
+        const n = stdout_file.read(&read_buf) catch break;
         if (n == 0) break;
+        if (log_enabled) {
+            debug_log.info("drained {d} more stdout bytes", .{n});
+        }
     }
 
+    if (log_enabled) {
+        debug_log.info("waiting for curl process to exit...", .{});
+    }
     const term = child.wait() catch return error.CurlWaitError;
+    if (log_enabled) {
+        debug_log.info("curl process terminated: {}", .{term});
+    }
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            const log = std.log.scoped(.sse);
+            log.err("curl failed with exit code={d}, url={s}", .{ code, url });
+            return error.CurlFailed;
+        },
         else => return error.CurlFailed,
+    }
+
+    // Clean up temp file if we created one
+    if (used_temp_file) {
+        std.fs.deleteFileAbsolute(body_path_buf[0..body_path_len]) catch {};
+        allocator.free(body_arg);
     }
 
     // Signal stream completion only after curl exits successfully.
