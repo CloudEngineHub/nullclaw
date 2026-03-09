@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
+const http_util = @import("../http_util.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 
@@ -209,6 +210,17 @@ pub const LarkChannel = struct {
         };
     }
 
+    fn componentAsSlice(component: std.Uri.Component) []const u8 {
+        return switch (component) {
+            .raw => |v| v,
+            .percent_encoded => |v| v,
+        };
+    }
+
+    fn statusCodeIsSuccess(code: u16) bool {
+        return code >= 200 and code < 300;
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Obtain a tenant access token from the Feishu/Lark API.
@@ -261,25 +273,17 @@ pub const LarkChannel = struct {
         try fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
         const body = fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+        const resp = http_util.curlPostWithStatus(
+            self.allocator,
+            url,
+            body,
+            &.{},
+        ) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
 
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-            },
-            .response_writer = &aw.writer,
-        }) catch return error.LarkApiError;
-
-        if (result.status != .ok) return error.LarkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
+        const resp_body = resp.body;
         if (resp_body.len == 0) return error.LarkApiError;
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
@@ -333,20 +337,17 @@ pub const LarkChannel = struct {
         try auth_fbs.writer().print("Bearer {s}", .{token});
         const auth_value = auth_fbs.getWritten();
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+        const send_resp = http_util.curlPostWithStatus(
+            self.allocator,
+            url,
+            body,
+            &.{auth_header},
+        ) catch return error.LarkApiError;
+        defer self.allocator.free(send_resp.body);
 
-        const send_result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                .{ .name = "Authorization", .value = auth_value },
-            },
-        }) catch return error.LarkApiError;
-
-        if (send_result.status == .unauthorized) {
+        if (send_resp.status_code == 401) {
             // Token expired — invalidate cache and retry once
             self.invalidateToken();
             const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
@@ -357,53 +358,92 @@ pub const LarkChannel = struct {
             try retry_auth_fbs.writer().print("Bearer {s}", .{new_token});
             const retry_auth_value = retry_auth_fbs.getWritten();
 
-            var retry_client = std.http.Client{ .allocator = self.allocator };
-            defer retry_client.deinit();
+            var retry_auth_header_buf: [576]u8 = undefined;
+            const retry_auth_header = std.fmt.bufPrint(&retry_auth_header_buf, "Authorization: {s}", .{retry_auth_value}) catch return error.LarkApiError;
+            const retry_resp = http_util.curlPostWithStatus(
+                self.allocator,
+                url,
+                body,
+                &.{retry_auth_header},
+            ) catch return error.LarkApiError;
+            defer self.allocator.free(retry_resp.body);
 
-            const retry_result = retry_client.fetch(.{
-                .location = .{ .url = url },
-                .method = .POST,
-                .payload = body,
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
-                    .{ .name = "Authorization", .value = retry_auth_value },
-                },
-            }) catch return error.LarkApiError;
-
-            if (retry_result.status != .ok) {
+            if (!statusCodeIsSuccess(retry_resp.status_code)) {
                 return error.LarkApiError;
             }
             return;
         }
 
-        if (send_result.status != .ok) {
+        if (!statusCodeIsSuccess(send_resp.status_code)) {
             return error.LarkApiError;
         }
     }
 
-    fn websocketHost(self: *const LarkChannel) []const u8 {
-        return if (self.use_feishu) "open.feishu.cn" else "open.larksuite.com";
+    fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("{s}/callback/ws/endpoint", .{self.apiBase()});
+        return fbs.getWritten();
     }
 
-    fn appendUrlQueryEscaped(writer: anytype, input: []const u8) !void {
-        for (input) |c| {
-            const is_unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-            if (is_unreserved) {
-                try writer.writeByte(c);
-            } else {
-                try writer.print("%{X:0>2}", .{c});
-            }
-        }
-    }
-
-    fn buildWebsocketPath(buf: []u8, app_id: []const u8, app_access_token: []const u8) ![]const u8 {
+    fn buildWebsocketConfigBody(buf: []u8, app_id: []const u8, app_secret: []const u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
-        try w.writeAll("/ws/v2?app_id=");
-        try appendUrlQueryEscaped(w, app_id);
-        try w.writeAll("&access_token=");
-        try appendUrlQueryEscaped(w, app_access_token);
+        try w.writeAll("{\"AppID\":");
+        try root.appendJsonStringW(w, app_id);
+        try w.writeAll(",\"AppSecret\":");
+        try root.appendJsonStringW(w, app_secret);
+        try w.writeAll("}");
         return fbs.getWritten();
+    }
+
+    fn extractWebsocketConnectUrl(allocator: std.mem.Allocator, resp_body: []const u8) ![]u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.LarkApiError;
+
+        if (parsed.value.object.get("code")) |code_val| {
+            if (code_val == .integer and code_val.integer != 0) return error.LarkApiError;
+        }
+
+        const data_val = parsed.value.object.get("data") orelse return error.LarkApiError;
+        if (data_val != .object) return error.LarkApiError;
+
+        const url_val = data_val.object.get("URL") orelse data_val.object.get("url") orelse return error.LarkApiError;
+        if (url_val != .string or url_val.string.len == 0) return error.LarkApiError;
+
+        return allocator.dupe(u8, url_val.string);
+    }
+
+    fn parseWebsocketConnectUrl(
+        connect_url: []const u8,
+        host_buf: []u8,
+        path_buf: []u8,
+    ) !struct { host: []const u8, port: u16, path: []const u8 } {
+        const uri = std.Uri.parse(connect_url) catch return error.LarkApiError;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.LarkApiError;
+
+        const host = uri.getHost(host_buf) catch return error.LarkApiError;
+        const port = uri.port orelse 443;
+        const raw_path = componentAsSlice(uri.path);
+        const query = if (uri.query) |q| componentAsSlice(q) else "";
+
+        var fbs = std.io.fixedBufferStream(path_buf);
+        const w = fbs.writer();
+        if (raw_path.len == 0) {
+            try w.writeByte('/');
+        } else {
+            if (raw_path[0] != '/') try w.writeByte('/');
+            try w.writeAll(raw_path);
+        }
+        if (query.len > 0) {
+            try w.writeByte('?');
+            try w.writeAll(query);
+        }
+        return .{
+            .host = host,
+            .port = port,
+            .path = fbs.getWritten(),
+        };
     }
 
     fn buildWebsocketPong(buf: []u8, ts: []const u8) ![]const u8 {
@@ -424,47 +464,25 @@ pub const LarkChannel = struct {
         return fbs.getWritten();
     }
 
-    fn fetchAppAccessToken(self: *LarkChannel) ![]const u8 {
-        const base = self.apiBase();
-
+    fn fetchWebsocketConnectUrl(self: *LarkChannel) ![]u8 {
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/auth/v3/app_access_token/internal", .{base});
-        const url = url_fbs.getWritten();
+        const url = try buildWebsocketConfigUrl(self, &url_buf);
 
         var body_buf: [512]u8 = undefined;
-        var body_fbs = std.io.fixedBufferStream(&body_buf);
-        try body_fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
-        const body = body_fbs.getWritten();
+        const body = try buildWebsocketConfigBody(&body_buf, self.app_id, self.app_secret);
 
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+        const resp = http_util.curlPostWithStatus(
+            self.allocator,
+            url,
+            body,
+            &.{
+                "locale: zh",
             },
-            .response_writer = &aw.writer,
-        }) catch return error.LarkApiError;
+        ) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
 
-        if (result.status != .ok) return error.LarkApiError;
-
-        const resp_body = aw.writer.buffer[0..aw.writer.end];
-        if (resp_body.len == 0) return error.LarkApiError;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return error.LarkApiError;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.LarkApiError;
-
-        const token_val = parsed.value.object.get("app_access_token") orelse return error.LarkApiError;
-        if (token_val != .string) return error.LarkApiError;
-        return self.allocator.dupe(u8, token_val.string);
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        return extractWebsocketConnectUrl(self.allocator, resp.body);
     }
 
     fn publishInboundMessage(self: *LarkChannel, msg: ParsedLarkMessage) void {
@@ -552,17 +570,18 @@ pub const LarkChannel = struct {
     }
 
     fn runWebsocketOnce(self: *LarkChannel) !void {
-        const app_access_token = try self.fetchAppAccessToken();
-        defer self.allocator.free(app_access_token);
+        const connect_url = try self.fetchWebsocketConnectUrl();
+        defer self.allocator.free(connect_url);
 
-        var path_buf: [1024]u8 = undefined;
-        const path = try buildWebsocketPath(&path_buf, self.app_id, app_access_token);
+        var host_buf: [256]u8 = undefined;
+        var path_buf: [2048]u8 = undefined;
+        const connect_parts = try parseWebsocketConnectUrl(connect_url, &host_buf, &path_buf);
 
         var ws = try websocket.WsClient.connect(
             self.allocator,
-            self.websocketHost(),
-            443,
-            path,
+            connect_parts.host,
+            connect_parts.port,
+            connect_parts.path,
             &.{},
         );
 
@@ -1056,18 +1075,27 @@ test "lark apiBase returns larksuite URL when use_feishu is false" {
     try std.testing.expectEqualStrings("https://open.larksuite.com/open-apis", ch.apiBase());
 }
 
-test "lark websocketHost follows region" {
+test "lark buildWebsocketConfigUrl follows region" {
     var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
     ch.use_feishu = true;
-    try std.testing.expectEqualStrings("open.feishu.cn", ch.websocketHost());
+    var feishu_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://open.feishu.cn/open-apis/callback/ws/endpoint",
+        try ch.buildWebsocketConfigUrl(&feishu_buf),
+    );
+
     ch.use_feishu = false;
-    try std.testing.expectEqualStrings("open.larksuite.com", ch.websocketHost());
+    var lark_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://open.larksuite.com/open-apis/callback/ws/endpoint",
+        try ch.buildWebsocketConfigUrl(&lark_buf),
+    );
 }
 
-test "lark buildWebsocketPath formats query parameters" {
+test "lark buildWebsocketConfigBody uses official field names" {
     var buf: [256]u8 = undefined;
-    const path = try LarkChannel.buildWebsocketPath(&buf, "cli_app", "tok_123");
-    try std.testing.expectEqualStrings("/ws/v2?app_id=cli_app&access_token=tok_123", path);
+    const body = try LarkChannel.buildWebsocketConfigBody(&buf, "cli_app", "sec_123");
+    try std.testing.expectEqualStrings("{\"AppID\":\"cli_app\",\"AppSecret\":\"sec_123\"}", body);
 }
 
 test "lark websocket pong and ack payload format" {
@@ -1306,13 +1334,27 @@ test "lark healthCheck websocket mode requires both running and connected" {
     try std.testing.expect(ch.healthCheck());
 }
 
-test "lark buildWebsocketPath handles special characters in token" {
-    var buf: [512]u8 = undefined;
-    const path = try LarkChannel.buildWebsocketPath(&buf, "app_id_with_special_chars", "token+with/special=chars");
-    try std.testing.expectEqualStrings(
-        "/ws/v2?app_id=app_id_with_special_chars&access_token=token%2Bwith%2Fspecial%3Dchars",
-        path,
+test "lark extractWebsocketConnectUrl parses official response shape" {
+    const allocator = std.testing.allocator;
+    const resp =
+        \\{"code":0,"data":{"URL":"wss://ws-client.feishu.cn/ws/?app_id=cli_xxx&device_id=dev1","ClientConfig":{"PingInterval":30}}}
+    ;
+    const url = try LarkChannel.extractWebsocketConnectUrl(allocator, resp);
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("wss://ws-client.feishu.cn/ws/?app_id=cli_xxx&device_id=dev1", url);
+}
+
+test "lark parseWebsocketConnectUrl extracts host port and path" {
+    var host_buf: [256]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const parsed = try LarkChannel.parseWebsocketConnectUrl(
+        "wss://ws-client.feishu.cn/v1/ws?app_id=cli_xxx&device_id=dev1",
+        &host_buf,
+        &path_buf,
     );
+    try std.testing.expectEqualStrings("ws-client.feishu.cn", parsed.host);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+    try std.testing.expectEqualStrings("/v1/ws?app_id=cli_xxx&device_id=dev1", parsed.path);
 }
 
 test "lark buildWebsocketPong handles empty timestamp" {
@@ -1379,20 +1421,6 @@ test "lark parseEventPayload handles websocket message with mentions" {
     try std.testing.expect(msgs[0].is_group);
     // Should strip @_user_1 placeholder
     try std.testing.expectEqualStrings("Hello everyone", msgs[0].content);
-}
-
-test "lark websocketHost returns correct host for feishu" {
-    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
-    ch.use_feishu = true;
-    const host = ch.websocketHost();
-    try std.testing.expectEqualStrings("open.feishu.cn", host);
-}
-
-test "lark websocketHost returns correct host for lark" {
-    var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
-    ch.use_feishu = false;
-    const host = ch.websocketHost();
-    try std.testing.expectEqualStrings("open.larksuite.com", host);
 }
 
 test "lark initFromConfig with websocket mode" {
