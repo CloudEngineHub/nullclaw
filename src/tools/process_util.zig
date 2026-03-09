@@ -27,6 +27,7 @@ extern "kernel32" fn GetACP() callconv(.winapi) std.os.windows.UINT;
 
 const CP_UTF8: std.os.windows.UINT = 65001;
 const CP_GBK: std.os.windows.UINT = 936;
+const MB_ERR_INVALID_CHARS: std.os.windows.DWORD = 0x00000008;
 
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 
@@ -131,15 +132,18 @@ fn tryDecodeWindowsCodePageToUtf8(
     if (input.len == 0 or code_page == 0) return null;
 
     const in_len: i32 = std.math.cast(i32, input.len) orelse return null;
+    // Keep UTF-8 strict so a console forced to CP_UTF8 does not swallow
+    // ACP/GBK bytes with U+FFFD substitutions before we can try fallbacks.
+    const decode_flags: std.os.windows.DWORD = if (code_page == CP_UTF8) MB_ERR_INVALID_CHARS else 0;
 
-    const wide_len = MultiByteToWideChar(code_page, 0, input.ptr, in_len, null, 0);
+    const wide_len = MultiByteToWideChar(code_page, decode_flags, input.ptr, in_len, null, 0);
     if (wide_len <= 0) return null;
 
     const wide_len_usize: usize = @intCast(wide_len);
     const wide = try allocator.alloc(u16, wide_len_usize);
     defer allocator.free(wide);
 
-    if (MultiByteToWideChar(code_page, 0, input.ptr, in_len, wide.ptr, wide_len) <= 0) return null;
+    if (MultiByteToWideChar(code_page, decode_flags, input.ptr, in_len, wide.ptr, wide_len) <= 0) return null;
 
     const utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide.ptr, wide_len, null, 0, null, null);
     if (utf8_len <= 0) return null;
@@ -383,4 +387,13 @@ test "windows gbk fallback decodes to utf8" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(decoded.?));
     const expected_utf8 = [_]u8{ 0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87 }; // "zhongwen" (Chinese chars) in UTF-8 bytes
     try std.testing.expectEqualSlices(u8, &expected_utf8, decoded.?);
+}
+
+test "windows utf8 decoder rejects gbk bytes so ansi fallback can run" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const gbk = [_]u8{ 0xD6, 0xD0, 0xCE, 0xC4 }; // "中文" in GBK/CP936
+    const decoded = try tryDecodeWindowsCodePageToUtf8(allocator, &gbk, CP_UTF8);
+    try std.testing.expect(decoded == null);
 }
