@@ -251,8 +251,11 @@ pub const WsClient = struct {
                     error.EndOfStream => return error.ConnectionClosed,
                     else => |e| return e,
                 };
-            } else self.stream.read(buf[total..]) catch |e| return e;
-            if (n == 0) return error.ConnectionClosed;
+            } else blk: {
+                const bytes = self.stream.read(buf[total..]) catch |e| return e;
+                if (bytes == 0) return error.ConnectionClosed;
+                break :blk bytes;
+            };
             total += n;
         }
     }
