@@ -2063,7 +2063,7 @@ pub fn scaffoldWorkspace(
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
-    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content);
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content, bootstrap_provider);
 }
 
 pub const ResetWorkspacePromptFilesOptions = struct {
@@ -2121,16 +2121,18 @@ pub fn resetWorkspacePromptFiles(
     for (files) |entry| {
         if (bootstrap_provider) |bp| {
             if (!options.dry_run) try bp.store(entry.filename, entry.content);
+        } else {
+            _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
         }
-        _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
         report.rewritten_files += 1;
     }
 
     if (options.include_bootstrap) {
         if (bootstrap_provider) |bp| {
             if (!options.dry_run) try bp.store("BOOTSTRAP.md", bootstrapTemplate());
+        } else {
+            _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
         }
-        _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
         report.rewritten_files += 1;
     }
 
@@ -2206,8 +2208,9 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
 }
 
 /// Write-if-missing with optional BootstrapProvider routing.
-/// When a provider is set, stores the content through the provider as well
-/// (the file write still happens so file-based backends stay consistent).
+/// When a provider is set, stores the content through the provider only.
+/// File-based providers (hybrid/markdown) write to disk themselves;
+/// memory-based providers (sqlite, postgres, …) store in the backend.
 fn storeOrWriteIfMissing(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -2219,6 +2222,7 @@ fn storeOrWriteIfMissing(
         if (!provider.exists(filename)) {
             try provider.store(filename, content);
         }
+        return;
     }
     try writeIfMissing(allocator, dir, filename, content);
 }
@@ -2229,6 +2233,7 @@ fn ensureBootstrapLifecycle(
     identity_template: []const u8,
     user_template: []const u8,
     had_legacy_user_content: bool,
+    bp: ?bootstrap_mod.BootstrapProvider,
 ) !void {
     const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
@@ -2236,7 +2241,7 @@ fn ensureBootstrapLifecycle(
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
     defer state.deinit(allocator);
     var state_dirty = false;
-    var bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+    var bootstrap_exists = if (bp) |provider| provider.exists("BOOTSTRAP.md") else fileExistsAbsolute(bootstrap_path);
 
     if (state.bootstrap_seeded_at == null and bootstrap_exists) {
         try markBootstrapSeededAt(allocator, &state);
@@ -2260,8 +2265,8 @@ fn ensureBootstrapLifecycle(
             try markOnboardingCompletedAt(allocator, &state);
             state_dirty = true;
         } else {
-            try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
-            bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+            try storeOrWriteIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), bp);
+            bootstrap_exists = if (bp) |provider| provider.exists("BOOTSTRAP.md") else fileExistsAbsolute(bootstrap_path);
             if (bootstrap_exists and state.bootstrap_seeded_at == null) {
                 try markBootstrapSeededAt(allocator, &state);
                 state_dirty = true;
