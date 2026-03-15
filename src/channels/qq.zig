@@ -2140,7 +2140,11 @@ test "qq healthCheck websocket requires running socket" {
     ch.running.store(true, .release);
     try std.testing.expect(!ch.healthCheck());
 
-    ch.ws_fd.store(42, .release);
+    const fake_socket: std.posix.socket_t = if (builtin.os.tag == .windows)
+        @ptrFromInt(1)
+    else
+        42;
+    ch.ws_fd.store(fake_socket, .release);
     try std.testing.expect(ch.healthCheck());
 }
 
