@@ -92,6 +92,10 @@ pub const WebFetchTool = struct {
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
+        if (builtin.is_test) {
+            return ToolResult.fail("Network disabled in tests");
+        }
+
         // Fetch URL via curl subprocess
         const headers = [_][]const u8{
             "User-Agent: nullclaw/0.1 (web_fetch tool)",
@@ -541,11 +545,8 @@ test "WebFetchTool allowlisted local host is allowed (fixes #393)" {
     const parsed = try root.parseTestArgs("{\"url\":\"https://127.0.0.1:8080/\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| testing.allocator.free(e);
-    // Request will fail (no server), but SSRF check should be bypassed
-    if (result.error_msg) |err| {
-        try testing.expect(std.mem.indexOf(u8, err, "Blocked local") == null);
-    }
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
 }
 
 test "WebFetchTool non-allowlisted local host still blocked" {

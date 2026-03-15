@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -130,6 +131,10 @@ pub const HttpRequestTool = struct {
 
         const body: ?[]const u8 = root.getString(args, "body");
 
+        if (builtin.is_test) {
+            return ToolResult.fail("Network disabled in tests");
+        }
+
         const status_result = runCurlRequestWithStatus(
             allocator,
             methodToSlice(method),
@@ -195,6 +200,10 @@ fn shouldUseCurlResolve(host: []const u8) bool {
     return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
 }
 
+fn shouldUsePinnedResolve(host: []const u8, connect_host: []const u8) bool {
+    return shouldUseCurlResolve(host) and !std.mem.eql(u8, host, connect_host);
+}
+
 fn buildCurlResolveEntry(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -241,7 +250,7 @@ fn runCurlRequestWithStatus(
 
     var resolve_entry: ?[]u8 = null;
     defer if (resolve_entry) |entry| allocator.free(entry);
-    if (shouldUseCurlResolve(host)) {
+    if (shouldUsePinnedResolve(host, connect_host)) {
         resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
         argv_buf[argc] = "--resolve";
         argc += 1;
@@ -729,7 +738,6 @@ test "execute rejects non-allowlisted domain" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "allowed_domains") != null);
 }
 
-
 // ── Allowlist SSRF bypass tests (Issue #393) ───────────────
 
 test "execute allows allowlisted private IP (fixes #393)" {
@@ -740,15 +748,9 @@ test "execute allows allowlisted private IP (fixes #393)" {
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
-    // This should NOT reject with SSRF - the allowlist bypasses it
-    // Note: actual network call will fail, but SSRF check is bypassed
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
-    // Request will fail (no server), but should NOT fail with SSRF error
-    if (result.error_msg) |err| {
-        try std.testing.expect(std.mem.indexOf(u8, err, "local") == null);
-        try std.testing.expect(std.mem.indexOf(u8, err, "blocked") == null);
-    }
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Network disabled in tests", result.error_msg.?);
 }
 
 test "execute rejects non-allowlisted domain before DNS resolution" {
@@ -773,6 +775,14 @@ test "http_request parameters JSON is valid" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "method") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "body") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "headers") != null);
+}
+
+test "shouldUsePinnedResolve skips allowlisted hostname" {
+    try std.testing.expect(!shouldUsePinnedResolve("searx.internal", "searx.internal"));
+}
+
+test "shouldUsePinnedResolve keeps pinning resolved hostname" {
+    try std.testing.expect(shouldUsePinnedResolve("example.com", "93.184.216.34"));
 }
 
 test "validateMethod case insensitive" {
