@@ -191,6 +191,7 @@ nullclaw channel start discord
 nullclaw channel start signal
 
 # Manage background service
+# Linux supports systemd user services and OpenRC
 nullclaw service install
 nullclaw service status
 

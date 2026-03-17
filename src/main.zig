@@ -419,13 +419,7 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         std.process.exit(1);
     };
 
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer cfg.deinit();
-
-    yc.service.handleCommand(allocator, service_cmd, cfg.config_path) catch |err| {
+    yc.service.handleCommand(allocator, service_cmd) catch |err| {
         const any_err: anyerror = err;
         switch (any_err) {
             error.UnsupportedPlatform => {
@@ -433,6 +427,10 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             },
             error.NoHomeDir => {
                 std.debug.print("Could not resolve home directory for service files.\n", .{});
+            },
+            error.OpenRcUnavailable => {
+                std.debug.print("OpenRC was detected, but the required OpenRC commands are unavailable.\n", .{});
+                std.debug.print("Verify `rc-service`, `rc-update`, and `openrc-run` are installed.\n", .{});
             },
             error.SystemctlUnavailable => {
                 std.debug.print("`systemctl` is not available; Linux service commands require systemd user services.\n", .{});
