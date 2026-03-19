@@ -1170,14 +1170,11 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 .strict => return error.InvalidCronStoreFormat,
             }
         };
-        const command = blk: {
+        const command_raw: ?[]const u8 = blk: {
             if (obj.get("command")) |v| {
                 if (v == .string and v.string.len > 0) break :blk v.string;
             }
-            switch (policy) {
-                .best_effort => continue,
-                .strict => return error.InvalidCronStoreFormat,
-            }
+            break :blk null;
         };
 
         const next_run_secs: i64 = blk: {
@@ -1231,6 +1228,18 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 if (v == .string and v.string.len > 0) break :blk v.string;
             }
             break :blk null;
+        };
+        // Agent jobs may omit "command" and rely solely on "prompt".
+        // Shell jobs still require a command.
+        const command: []const u8 = blk: {
+            if (command_raw) |c| break :blk c;
+            if (job_type == .agent) {
+                if (prompt) |p| break :blk p;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
         };
         const model = blk: {
             if (obj.get("model")) |v| {
@@ -2184,6 +2193,28 @@ test "save and load roundtrip" {
     try std.testing.expect(loaded[0].last_status != null);
     try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "load agent job without command field falls back to prompt" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    // Write a cron.json with an agent job that has no "command" field
+    const json =
+        \\[{"id":"ag-1","expression":"0 7 * * 1","job_type":"agent","prompt":"Check traffic","model":"glm-cn/glm-5-turbo","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
+    ;
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(json);
+
+    try loadJobs(&scheduler);
+
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings("Check traffic", jobs[0].command);
+    try std.testing.expectEqualStrings("Check traffic", jobs[0].prompt.?);
 }
 
 test "save and load roundtrip keeps delivery account routing" {
