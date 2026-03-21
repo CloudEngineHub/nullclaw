@@ -71,7 +71,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "cohere", .url = "https://api.cohere.com/compatibility", .display = "Cohere" },
     .{ .name = "telnyx", .url = "https://api.telnyx.com/v2/ai", .display = "Telnyx" },
 
-    // ── Gateways & Aggregators ───────────────────────────────────────────────────
+    // ── Gateways & Aggregators ────────────────────────────────────────────
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
     .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
@@ -90,13 +90,13 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "astrai", .url = "https://as-trai.com/v1", .display = "Astrai" },
     .{ .name = "poe", .url = "https://api.poe.com/v1", .display = "Poe" },
 
-    // ── China Providers — general ───────────────────────────────────────────────────
+    // ── China Providers — general ─────────────────────────────────────────
     .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
+    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
     .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
@@ -109,26 +109,26 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "tencent", .url = "https://api.hunyuan.cloud.tencent.com/v1", .display = "Hunyuan" },
     .{ .name = "baichuan", .url = "https://api.baichuan-ai.com/v1", .display = "Baichuan" },
 
-    // ── China Providers — CN endpoints ──────────────────────────────────────────────
+    // ── China Providers — CN endpoints ────────────────────────────────────
     .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
     .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
 
-    // ── International variants ────────────────────────────────────────────────────
+    // ── International variants ────────────────────────────────────────────
     .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
+    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true },
+    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
+    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true },
     .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
@@ -138,14 +138,14 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "dashscope-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "byteplus", .url = "https://ark.ap-southeast.bytepluses.com/api/v3", .display = "BytePlus" },
 
-    // ── Coding-specific endpoints ───────────────────────────────────────────────────
+    // ── Coding-specific endpoints ─────────────────────────────────────────
     .{ .name = "kimi-code", .url = "https://api.kimi.com/coding/v1", .display = "Kimi Code" },
     .{ .name = "kimi_coding", .url = "https://api.kimi.com/coding/v1", .display = "Kimi Code" },
     .{ .name = "volcengine-plan", .url = "https://ark.cn-beijing.volces.com/api/coding/v3", .display = "Doubao" },
     .{ .name = "byteplus-plan", .url = "https://ark.ap-southeast.bytepluses.com/api/coding/v3", .display = "BytePlus" },
     .{ .name = "qwen-portal", .url = "https://portal.qwen.ai/v1", .display = "Qwen Portal", .enable_thinking_param = true },
 
-    // ── Infrastructure & Cloud ────────────────────────────────────────────────────
+    // ── Infrastructure & Cloud ────────────────────────────────────────────
     .{ .name = "bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
     .{ .name = "aws-bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
     .{ .name = "cloudflare", .url = "https://gateway.ai.cloudflare.com/v1", .display = "Cloudflare AI Gateway" },
@@ -157,8 +157,10 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "build.nvidia.com", .url = "https://integrate.api.nvidia.com/v1", .display = "NVIDIA NIM" },
     .{ .name = "ovhcloud", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
     .{ .name = "ovh", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
+    .{ .name = "novita", .url = "https://api.novita.ai/openai/v1", .display = "Novita" },
+    .{ .name = "novita-ai", .url = "https://api.novita.ai/openai/v1", .display = "Novita" },
 
-    // ── Local Servers ─────────────────────────────────────────────────────────────
+    // ── Local Servers ─────────────────────────────────────────────────────
     .{ .name = "lmstudio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
     .{ .name = "lm-studio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
     .{ .name = "vllm", .url = "http://localhost:8000/v1", .display = "vLLM" },
@@ -511,6 +513,8 @@ test "compatibleProviderUrl new providers" {
     try std.testing.expectEqualStrings("https://api.siliconflow.cn/v1", compatibleProviderUrl("siliconflow").?);
     try std.testing.expectEqualStrings("https://router.shengsuanyun.com/api/v1", compatibleProviderUrl("shengsuanyun").?);
     try std.testing.expectEqualStrings("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", compatibleProviderUrl("ovhcloud").?);
+    try std.testing.expectEqualStrings("https://api.novita.ai/openai/v1", compatibleProviderUrl("novita").?);
+    try std.testing.expectEqualStrings("https://api.novita.ai/openai/v1", compatibleProviderUrl("novita-ai").?);
     try std.testing.expectEqualStrings("https://ark.ap-southeast.bytepluses.com/api/v3", compatibleProviderUrl("byteplus").?);
     try std.testing.expectEqualStrings("https://chutes.ai/api/v1", compatibleProviderUrl("chutes").?);
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
@@ -549,10 +553,8 @@ test "compatibleProviderUrl CN/intl variants" {
     try std.testing.expectEqualStrings("https://api.z.ai/api/paas/v4", compatibleProviderUrl("glm-global").?);
     try std.testing.expectEqualStrings("https://api.minimaxi.com/v1", compatibleProviderUrl("minimax-cn").?);
     try std.testing.expectEqualStrings("https://api.minimax.io/v1", compatibleProviderUrl("minimax-intl").?);
-    // Hunyuan (Tencent Cloud) — OpenAI-compatible endpoint
     try std.testing.expectEqualStrings("https://api.hunyuan.cloud.tencent.com/v1", compatibleProviderUrl("hunyuan").?);
     try std.testing.expectEqualStrings("https://api.hunyuan.cloud.tencent.com/v1", compatibleProviderUrl("tencent").?);
-    // Baichuan
     try std.testing.expectEqualStrings("https://api.baichuan-ai.com/v1", compatibleProviderUrl("baichuan").?);
 }
 
@@ -584,6 +586,11 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("Hugging Face", compatibleProviderDisplayName("huggingface"));
     try std.testing.expectEqualStrings("vLLM", compatibleProviderDisplayName("vllm"));
     try std.testing.expectEqualStrings("OVHcloud", compatibleProviderDisplayName("ovhcloud"));
+    try std.testing.expectEqualStrings("Hunyuan", compatibleProviderDisplayName("hunyuan"));
+    try std.testing.expectEqualStrings("Hunyuan", compatibleProviderDisplayName("tencent"));
+    try std.testing.expectEqualStrings("Baichuan", compatibleProviderDisplayName("baichuan"));
+    try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita"));
+    try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita-ai"));
     try std.testing.expectEqualStrings("Custom", compatibleProviderDisplayName("nonexistent"));
     try std.testing.expectEqualStrings("Telnyx", compatibleProviderDisplayName("telnyx"));
 }
@@ -596,14 +603,39 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("lm-studio") == .compatible_provider);
     try std.testing.expect(classifyProvider("astrai") == .compatible_provider);
     try std.testing.expect(classifyProvider("telnyx") == .compatible_provider);
+    try std.testing.expect(classifyProvider("hunyuan") == .compatible_provider);
+    try std.testing.expect(classifyProvider("tencent") == .compatible_provider);
+    try std.testing.expect(classifyProvider("baichuan") == .compatible_provider);
+    try std.testing.expect(classifyProvider("novita") == .compatible_provider);
+    try std.testing.expect(classifyProvider("novita-ai") == .compatible_provider);
 }
 
 test "findCompatProvider returns correct flags" {
     // GLM has no_responses_fallback and thinking_param
     const glm = findCompatProvider("glm").?;
     try std.testing.expect(glm.no_responses_fallback);
+    try std.testing.expect(glm.native_tools);
     try std.testing.expect(!glm.merge_system_into_user);
     try std.testing.expect(glm.thinking_param);
+
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+    for (native_tool_aliases) |provider_name| {
+        try std.testing.expect(findCompatProvider(provider_name).?.native_tools);
+    }
 
     // MiniMax has both flags
     const minimax = findCompatProvider("minimax").?;
@@ -629,6 +661,58 @@ test "findCompatProvider returns correct flags" {
     // Fireworks has non-streaming max_tokens cap.
     const fireworks = findCompatProvider("fireworks").?;
     try std.testing.expectEqual(@as(?u32, 4096), fireworks.max_tokens_non_streaming);
+}
+
+test "fromConfig keeps native_tools enabled for z.ai/glm aliases" {
+    const alloc = std.testing.allocator;
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+
+    for (native_tool_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, true, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(holder.compatible.native_tools);
+    }
+}
+
+test "fromConfig still allows native_tools opt-out for z.ai/glm aliases" {
+    const alloc = std.testing.allocator;
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+
+    for (native_tool_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, false, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(!holder.compatible.native_tools);
+    }
 }
 
 test "fromConfig applies no_responses_fallback flag" {
@@ -820,5 +904,5 @@ test "ProviderHolder.fromConfig routes to correct variant" {
 
 test "compat_providers table count" {
     // Verify we have the expected number of entries (guard against accidental deletions).
-    try std.testing.expect(compat_providers.len >= 89);
+    try std.testing.expect(compat_providers.len >= 92);
 }
