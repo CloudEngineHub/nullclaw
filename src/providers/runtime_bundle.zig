@@ -581,6 +581,30 @@ test "RuntimeProviderBundle threads api_mode to primary provider" {
     );
 }
 
+test "RuntimeProviderBundle threads chat_template_enable_thinking_param to primary provider" {
+    const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
+        .{
+            .name = "custom:https://example.com/v1",
+            .api_key = "sk_test",
+            .chat_template_enable_thinking_param = true,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "custom:https://example.com/v1",
+        .providers = &providers_cfg,
+    };
+
+    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
+    defer bundle.deinit();
+
+    try std.testing.expect(bundle.primary_holder != null);
+    try std.testing.expect(bundle.primary_holder.?.* == .compatible);
+    try std.testing.expect(bundle.primary_holder.?.compatible.chat_template_enable_thinking_param);
+}
+
 test "RuntimeProviderBundle threads max_streaming_prompt_bytes to fallback providers" {
     // GAP-17: Fallback providers listed in reliability.fallback_providers must
     // also have their limit wired through from the per-provider config.
