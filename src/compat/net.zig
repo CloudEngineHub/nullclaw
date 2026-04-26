@@ -23,6 +23,7 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
     const rc = posix.system.fcntl(handle, posix.F.GETFL, @as(usize, 0));
     const current_flags = switch (posix.errno(rc)) {
         .SUCCESS => @as(usize, @intCast(rc)),
+        .AGAIN => return error.WouldBlock,
         else => |err| return posix.unexpectedErrno(err),
     };
     const nonblocking_flag = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
@@ -34,6 +35,7 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
 
     switch (posix.errno(posix.system.fcntl(handle, posix.F.SETFL, next_flags))) {
         .SUCCESS => {},
+        .AGAIN => return error.WouldBlock,
         .INVAL => |err| return posix.unexpectedErrno(err),
         else => |err| return posix.unexpectedErrno(err),
     }
