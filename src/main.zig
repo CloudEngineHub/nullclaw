@@ -50,7 +50,7 @@ const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
 const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|store|update|delete|drain-outbox|forget";
 const HISTORY_SUBCOMMANDS = "list|show";
-const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
+const WORKSPACE_SUBCOMMANDS = "edit|reset-md|audit";
 const MODELS_SUBCOMMANDS = "list|summary|info|benchmark|refresh";
 const MCP_SUBCOMMANDS = "list|info";
 const AUTH_SUBCOMMANDS = "login|status|logout";
@@ -1704,6 +1704,12 @@ fn printWorkspaceUsage() void {
         \\      --clear-memory-md    Remove MEMORY.md and memory.md if present
         \\      --dry-run            Show what would be changed without modifying files
         \\
+        \\  audit [--json] [--staged] [--fail-on <none|medium|high|critical>]
+        \\      Scan the workspace or staged Git diff for likely secret leaks.
+        \\      --staged             Audit only the staged diff (git diff --cached)
+        \\      --json               Emit machine-readable JSON
+        \\      --fail-on            Exit non-zero when findings meet or exceed the threshold
+        \\
     , .{WORKSPACE_SUBCOMMANDS}), .{});
 }
 
@@ -3106,6 +3112,11 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
         return;
     }
 
+    if (std.mem.eql(u8, subcmd, "audit")) {
+        try runWorkspaceAudit(allocator, sub_args[1..], cfg);
+        return;
+    }
+
     if (!std.mem.eql(u8, subcmd, "reset-md")) {
         std.debug.print("Unknown workspace command: {s}\n\n", .{subcmd});
         printWorkspaceUsage();
@@ -3205,6 +3216,49 @@ fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg:
         std.debug.print("Failed to launch editor '{s}': {s}\n", .{ editor, @errorName(err) });
         std_compat.process.exit(1);
     };
+}
+
+fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) !void {
+    var options = yc.workspace_audit.Options{
+        .workspace_dir = cfg.workspace_dir,
+    };
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            options.json = true;
+        } else if (std.mem.eql(u8, arg, "--staged")) {
+            options.staged = true;
+        } else if (std.mem.eql(u8, arg, "--fail-on")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --fail-on\n\n", .{});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            }
+            options.fail_on = yc.workspace_audit.FailureThreshold.parse(args[i]) orelse {
+                std.debug.print("Invalid --fail-on value: {s}\n\n", .{args[i]});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            };
+        } else {
+            std.debug.print("Unknown workspace audit option: {s}\n\n", .{arg});
+            printWorkspaceUsage();
+            std_compat.process.exit(1);
+        }
+    }
+
+    const exit_code = yc.workspace_audit.run(allocator, options) catch |err| {
+        switch (err) {
+            error.NotGitRepository => std.debug.print("workspace audit: staged mode requires a Git repository\n", .{}),
+            error.GitUnavailable => std.debug.print("workspace audit: git is not available in this environment\n", .{}),
+            error.GitDiffFailed => std.debug.print("workspace audit: failed to read staged diff\n", .{}),
+            else => std.debug.print("workspace audit failed: {s}\n", .{@errorName(err)}),
+        }
+        std_compat.process.exit(1);
+    };
+    if (exit_code != 0) std_compat.process.exit(exit_code);
 }
 
 fn getEnvVarOwnedOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {

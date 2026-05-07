@@ -24,6 +24,7 @@ pub const state = @import("state.zig");
 pub const status = @import("status.zig");
 pub const onboard = @import("onboard.zig");
 pub const doctor = @import("doctor.zig");
+pub const workspace_audit = @import("workspace_audit.zig");
 pub const capabilities = @import("capabilities.zig");
 pub const config_mutator = @import("config_mutator.zig");
 pub const service = @import("service.zig");
