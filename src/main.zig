@@ -1704,10 +1704,12 @@ fn printWorkspaceUsage() void {
         \\      --clear-memory-md    Remove MEMORY.md and memory.md if present
         \\      --dry-run            Show what would be changed without modifying files
         \\
-        \\  audit [--json] [--staged] [--fail-on <none|medium|high|critical>]
+        \\  audit [--json] [--staged] [--only-secrets] [--exclude <path-substring>] [--fail-on <none|medium|high|critical>]
         \\      Scan the workspace or staged Git diff for likely secret leaks.
         \\      --staged             Audit only the staged diff (git diff --cached)
         \\      --json               Emit machine-readable JSON
+        \\      --only-secrets       Report only high/critical findings
+        \\      --exclude            Repeatable path substring to skip during scanning
         \\      --fail-on            Exit non-zero when findings meet or exceed the threshold
         \\
     , .{WORKSPACE_SUBCOMMANDS}), .{});
@@ -3219,6 +3221,9 @@ fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg:
 }
 
 fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) !void {
+    var exclude_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer exclude_patterns.deinit(allocator);
+
     var options = yc.workspace_audit.Options{
         .workspace_dir = cfg.workspace_dir,
     };
@@ -3230,6 +3235,16 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
             options.json = true;
         } else if (std.mem.eql(u8, arg, "--staged")) {
             options.staged = true;
+        } else if (std.mem.eql(u8, arg, "--only-secrets")) {
+            options.only_secrets = true;
+        } else if (std.mem.eql(u8, arg, "--exclude")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Missing value for --exclude\n\n", .{});
+                printWorkspaceUsage();
+                std_compat.process.exit(1);
+            }
+            try exclude_patterns.append(allocator, args[i]);
         } else if (std.mem.eql(u8, arg, "--fail-on")) {
             i += 1;
             if (i >= args.len) {
@@ -3248,6 +3263,8 @@ fn runWorkspaceAudit(allocator: std.mem.Allocator, args: []const []const u8, cfg
             std_compat.process.exit(1);
         }
     }
+
+    options.exclude_patterns = exclude_patterns.items;
 
     const exit_code = yc.workspace_audit.run(allocator, options) catch |err| {
         switch (err) {

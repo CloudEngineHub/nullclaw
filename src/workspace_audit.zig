@@ -15,13 +15,29 @@ const MAX_DIFF_BYTES: usize = 512 * 1024;
 
 const skipped_dirs = [_][]const u8{
     ".git",
+    ".zig-cache",
     "zig-cache",
     "zig-out",
+    "zig-pkg",
     "node_modules",
     "vendor",
     "dist",
     "build",
     "target",
+};
+
+const ignored_path_prefixes = [_][]const u8{
+    ".git/",
+    ".zig-cache/",
+    "zig-cache/",
+    "zig-out/",
+    "zig-pkg/",
+    "node_modules/",
+    "vendor/",
+    "dist/",
+    "build/",
+    "target/",
+    "coverage/",
 };
 
 const token_prefixes = [_][]const u8{
@@ -54,6 +70,20 @@ pub const Severity = enum {
             .medium => 1,
             .high => 2,
             .critical => 3,
+        };
+    }
+};
+
+pub const Confidence = enum {
+    low,
+    medium,
+    high,
+
+    pub fn toString(self: Confidence) []const u8 {
+        return switch (self) {
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
         };
     }
 };
@@ -110,10 +140,13 @@ pub const Options = struct {
     json: bool = false,
     staged: bool = false,
     fail_on: FailureThreshold = .high,
+    only_secrets: bool = false,
+    exclude_patterns: []const []const u8 = &.{},
 };
 
 pub const Finding = struct {
     severity: Severity,
+    confidence: Confidence,
     rule: []u8,
     path: []u8,
     line: ?usize,
@@ -159,7 +192,16 @@ pub const AuditError = error{
 
 const DetectedRule = struct {
     severity: Severity,
+    confidence: Confidence,
     rule: []const u8,
+};
+
+const PathCategory = enum {
+    config,
+    code,
+    docs,
+    vendor_like,
+    neutral,
 };
 
 pub fn run(allocator: Allocator, options: Options) !u8 {
@@ -196,9 +238,9 @@ pub fn buildReport(allocator: Allocator, workspace_dir: []const u8, options: Opt
     if (options.staged) {
         const diff = try readStagedDiff(allocator, workspace_dir);
         defer allocator.free(diff);
-        try scanStagedDiff(allocator, diff, &findings);
+        try scanStagedDiff(allocator, diff, options, &findings);
     } else {
-        try scanWorkspaceFiles(allocator, workspace_dir, workspace_dir, &findings);
+        try scanWorkspaceFiles(allocator, workspace_dir, workspace_dir, options, &findings);
     }
 
     var report = Report{
@@ -275,6 +317,7 @@ fn scanWorkspaceFiles(
     allocator: Allocator,
     root_dir: []const u8,
     current_dir: []const u8,
+    options: Options,
     findings: *std.ArrayListUnmanaged(Finding),
 ) !void {
     var dir = try std_compat.fs.openDirAbsolute(current_dir, .{ .iterate = true });
@@ -288,8 +331,8 @@ fn scanWorkspaceFiles(
         defer allocator.free(child_path);
 
         switch (entry.kind) {
-            .directory => try scanWorkspaceFiles(allocator, root_dir, child_path, findings),
-            .file => try scanWorkspaceFile(allocator, root_dir, child_path, findings),
+            .directory => try scanWorkspaceFiles(allocator, root_dir, child_path, options, findings),
+            .file => try scanWorkspaceFile(allocator, root_dir, child_path, options, findings),
             else => {},
         }
     }
@@ -299,10 +342,13 @@ fn scanWorkspaceFile(
     allocator: Allocator,
     root_dir: []const u8,
     file_path: []const u8,
+    options: Options,
     findings: *std.ArrayListUnmanaged(Finding),
 ) !void {
     const rel_path = try std_compat.fs.path.relative(allocator, root_dir, file_path);
     defer allocator.free(rel_path);
+
+    if (shouldIgnorePath(rel_path, options.exclude_patterns)) return;
 
     const contents = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, file_path, MAX_SCAN_FILE_BYTES) catch |err| switch (err) {
         error.StreamTooLong => return,
@@ -312,10 +358,15 @@ fn scanWorkspaceFile(
     defer allocator.free(contents);
 
     if (isProbablyBinary(contents)) return;
-    try scanText(allocator, rel_path, contents, .workspace_file, findings);
+    try scanText(allocator, rel_path, contents, .workspace_file, options, findings);
 }
 
-fn scanStagedDiff(allocator: Allocator, diff: []const u8, findings: *std.ArrayListUnmanaged(Finding)) !void {
+fn scanStagedDiff(
+    allocator: Allocator,
+    diff: []const u8,
+    options: Options,
+    findings: *std.ArrayListUnmanaged(Finding),
+) !void {
     var current_file: ?[]const u8 = null;
     var current_line: ?usize = null;
 
@@ -337,7 +388,7 @@ fn scanStagedDiff(allocator: Allocator, diff: []const u8, findings: *std.ArrayLi
         switch (line[0]) {
             '+' => {
                 if (std.mem.startsWith(u8, line, "+++")) continue;
-                try scanDiffLine(allocator, current_file.?, current_line.?, line[1..], findings);
+                try scanDiffLine(allocator, current_file.?, current_line.?, line[1..], options, findings);
                 current_line.? += 1;
             },
             ' ' => current_line.? += 1,
@@ -351,10 +402,12 @@ fn scanDiffLine(
     path: []const u8,
     line_no: usize,
     line: []const u8,
+    options: Options,
     findings: *std.ArrayListUnmanaged(Finding),
 ) !void {
+    if (shouldIgnorePath(path, options.exclude_patterns)) return;
     if (detectLine(path, line, .git_staged_diff)) |rule| {
-        try appendFinding(allocator, findings, rule, path, line_no, .git_staged_diff, line);
+        try appendFinding(allocator, findings, options, rule, path, line_no, .git_staged_diff, line);
     }
 }
 
@@ -363,6 +416,7 @@ fn scanText(
     path: []const u8,
     text: []const u8,
     source: FindingSource,
+    options: Options,
     findings: *std.ArrayListUnmanaged(Finding),
 ) !void {
     var line_no: usize = 1;
@@ -371,7 +425,7 @@ fn scanText(
         const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
         const line = std_compat.mem.trimRight(u8, text[start..end], "\r");
         if (detectLine(path, line, source)) |rule| {
-            try appendFinding(allocator, findings, rule, path, line_no, source, line);
+            try appendFinding(allocator, findings, options, rule, path, line_no, source, line);
         }
         if (end == text.len) break;
         start = end + 1;
@@ -381,30 +435,26 @@ fn scanText(
 
 fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?DetectedRule {
     if (line.len == 0) return null;
+    const path_category = classifyPath(path);
 
     if (containsPrivateKeyMarker(line)) {
-        return .{ .severity = .critical, .rule = "private_key_block" };
+        return .{ .severity = .critical, .confidence = .high, .rule = "private_key_block" };
     }
 
     if (hasCredentialUrl(line)) {
-        return .{ .severity = .high, .rule = "credential_in_url" };
-    }
-
-    if (matchSecretAssignment(line)) |assignment| {
-        const value = normalizeValue(assignment.value);
-        if (value.len == 0 or looksPlaceholder(value)) return null;
-        const severity: Severity = if (hasTokenPrefix(value) or isHighRiskKeyword(assignment.key))
-            .high
-        else
-            .medium;
         return .{
-            .severity = severity,
-            .rule = if (std.mem.indexOf(u8, path, ".env") != null) "env_secret_assignment" else "secret_assignment",
+            .severity = .high,
+            .confidence = if (path_category == .docs or path_category == .code) .medium else .high,
+            .rule = "credential_in_url",
         };
     }
 
+    if (matchSecretAssignment(line)) |assignment| {
+        return classifySecretAssignment(path, line, path_category, assignment);
+    }
+
     if (source == .git_staged_diff and hasTokenPrefix(line) and !looksPlaceholder(line)) {
-        return .{ .severity = .high, .rule = "hardcoded_token" };
+        return .{ .severity = .high, .confidence = .high, .rule = "hardcoded_token" };
     }
 
     return null;
@@ -413,6 +463,7 @@ fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?Detect
 const AssignmentMatch = struct {
     key: []const u8,
     value: []const u8,
+    quoted: bool,
 };
 
 fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
@@ -438,6 +489,7 @@ fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
             pos += 1;
             while (pos < line.len and (line[pos] == ' ' or line[pos] == '"' or line[pos] == '\'')) pos += 1;
             if (pos >= line.len) continue;
+            const quoted = pos > 0 and (line[pos - 1] == '"' or line[pos - 1] == '\'');
 
             const value_start = pos;
             var value_end = value_start;
@@ -450,6 +502,7 @@ fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
             return .{
                 .key = line[idx .. idx + keyword.len],
                 .value = line[value_start..value_end],
+                .quoted = quoted,
             };
         }
     }
@@ -535,14 +588,18 @@ fn looksPlaceholder(text: []const u8) bool {
 fn appendFinding(
     allocator: Allocator,
     findings: *std.ArrayListUnmanaged(Finding),
+    options: Options,
     rule: DetectedRule,
     path: []const u8,
     line_no: usize,
     source: FindingSource,
     raw_preview: []const u8,
 ) !void {
+    if (options.only_secrets and rule.severity.rank() < Severity.high.rank()) return;
+
     try findings.append(allocator, .{
         .severity = rule.severity,
+        .confidence = rule.confidence,
         .rule = try allocator.dupe(u8, rule.rule),
         .path = try allocator.dupe(u8, path),
         .line = line_no,
@@ -566,6 +623,18 @@ fn shouldSkipEntry(name: []const u8, kind: std_compat.fs.File.Kind) bool {
         for (skipped_dirs) |dir_name| {
             if (std.mem.eql(u8, name, dir_name)) return true;
         }
+    }
+    return false;
+}
+
+fn shouldIgnorePath(path: []const u8, exclude_patterns: []const []const u8) bool {
+    for (ignored_path_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, path, prefix)) return true;
+    }
+
+    for (exclude_patterns) |pattern| {
+        if (pattern.len == 0) continue;
+        if (std.mem.indexOf(u8, path, pattern) != null) return true;
     }
     return false;
 }
@@ -596,6 +665,150 @@ fn parseAddedHunkStart(line: []const u8) ?usize {
 
 fn containsText(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+fn classifyPath(path: []const u8) PathCategory {
+    if (std.mem.startsWith(u8, path, "vendor/") or
+        std.mem.startsWith(u8, path, "zig-pkg/") or
+        std.mem.startsWith(u8, path, "node_modules/"))
+    {
+        return .vendor_like;
+    }
+    if (isDocumentationPath(path)) return .docs;
+    if (isConfigLikePath(path)) return .config;
+    if (isCodePath(path)) return .code;
+    return .neutral;
+}
+
+fn classifySecretAssignment(
+    path: []const u8,
+    line: []const u8,
+    path_category: PathCategory,
+    assignment: AssignmentMatch,
+) ?DetectedRule {
+    const value = normalizeValue(assignment.value);
+    if (value.len == 0 or looksPlaceholder(value)) return null;
+
+    const known_token = hasTokenPrefix(value);
+    const opaque_value = looksOpaqueSecretValue(value);
+    const expression = looksLikeExpression(value) and !known_token and !opaque_value;
+    const high_risk_keyword = isHighRiskKeyword(assignment.key);
+
+    if (expression or looksLikeAccessorLine(line)) return null;
+
+    switch (path_category) {
+        .vendor_like => {
+            if (!known_token) return null;
+        },
+        .docs => {
+            if (!known_token and !(assignment.quoted and opaque_value)) return null;
+        },
+        .code => {
+            if (!known_token and !(assignment.quoted and (opaque_value or high_risk_keyword))) return null;
+        },
+        .config => {
+            if (!known_token and !opaque_value and !(high_risk_keyword and (assignment.quoted or value.len >= 8))) {
+                return null;
+            }
+        },
+        .neutral => {
+            if (!known_token and !opaque_value and !(high_risk_keyword and (assignment.quoted or value.len >= 8))) {
+                return null;
+            }
+        },
+    }
+
+    const severity: Severity = if (known_token or high_risk_keyword or (path_category == .config and opaque_value))
+        .high
+    else
+        .medium;
+    const confidence: Confidence = if (known_token)
+        .high
+    else switch (path_category) {
+        .config => if (opaque_value or high_risk_keyword) .medium else .low,
+        .neutral => if (opaque_value or high_risk_keyword) .medium else .low,
+        .code => .medium,
+        .docs => .low,
+        .vendor_like => .medium,
+    };
+
+    return .{
+        .severity = severity,
+        .confidence = confidence,
+        .rule = if (std.mem.indexOf(u8, path, ".env") != null) "env_secret_assignment" else "secret_assignment",
+    };
+}
+
+fn isDocumentationPath(path: []const u8) bool {
+    if (std.mem.startsWith(u8, path, "docs/") or std.mem.startsWith(u8, path, "reference/")) return true;
+
+    const basename = std.fs.path.basename(path);
+    if (eqlIgnoreCase(basename, "README") or eqlIgnoreCase(basename, "README.md")) return true;
+
+    const ext = std.fs.path.extension(path);
+    return eqlIgnoreCase(ext, ".md") or eqlIgnoreCase(ext, ".rst") or eqlIgnoreCase(ext, ".adoc");
+}
+
+fn isConfigLikePath(path: []const u8) bool {
+    const basename = std.fs.path.basename(path);
+    const ext = std.fs.path.extension(path);
+
+    if (std.mem.startsWith(u8, basename, ".env")) return true;
+    if (eqlIgnoreCase(ext, ".env") or eqlIgnoreCase(ext, ".pem") or eqlIgnoreCase(ext, ".key") or eqlIgnoreCase(ext, ".crt") or eqlIgnoreCase(ext, ".cer") or eqlIgnoreCase(ext, ".p12") or eqlIgnoreCase(ext, ".pfx")) {
+        return true;
+    }
+    if (eqlIgnoreCase(ext, ".json") or eqlIgnoreCase(ext, ".yaml") or eqlIgnoreCase(ext, ".yml") or eqlIgnoreCase(ext, ".toml") or eqlIgnoreCase(ext, ".ini") or eqlIgnoreCase(ext, ".conf") or eqlIgnoreCase(ext, ".properties")) {
+        return true;
+    }
+    return indexOfIgnoreCase(basename, "secret") != null or
+        indexOfIgnoreCase(basename, "credential") != null or
+        indexOfIgnoreCase(basename, "config") != null;
+}
+
+fn isCodePath(path: []const u8) bool {
+    const ext = std.fs.path.extension(path);
+    const code_exts = [_][]const u8{
+        ".zig", ".c",    ".h",   ".cc",   ".cpp", ".hpp",   ".rs", ".go",  ".py", ".js",
+        ".ts",  ".tsx",  ".jsx", ".java", ".kt",  ".swift", ".rb", ".php", ".cs", ".scala",
+        ".sh",  ".bash", ".zsh",
+    };
+    for (code_exts) |code_ext| {
+        if (eqlIgnoreCase(ext, code_ext)) return true;
+    }
+    return false;
+}
+
+fn looksOpaqueSecretValue(value: []const u8) bool {
+    if (value.len < 16) return false;
+    if (std.mem.indexOfAny(u8, value, " \t(){}[]") != null) return false;
+
+    var alpha: usize = 0;
+    var digit: usize = 0;
+    var allowed: usize = 0;
+    for (value) |ch| {
+        if (std.ascii.isAlphabetic(ch)) alpha += 1;
+        if (std.ascii.isDigit(ch)) digit += 1;
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == ':' or ch == '/' or ch == '+' or ch == '=') {
+            allowed += 1;
+        }
+    }
+    if (alpha == 0 or digit == 0) return false;
+    return allowed * 100 >= value.len * 85;
+}
+
+fn looksLikeExpression(value: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, value, '(') != null or std.mem.indexOfScalar(u8, value, ')') != null) return true;
+    if (std.mem.indexOf(u8, value, "std.") != null) return true;
+    if (std.mem.indexOf(u8, value, ".get") != null) return true;
+    if (std.mem.indexOf(u8, value, "trim") != null and std.mem.indexOfScalar(u8, value, '(') != null) return true;
+    if (std.mem.indexOfScalar(u8, value, '{') != null or std.mem.indexOfScalar(u8, value, '}') != null) return true;
+    return false;
+}
+
+fn looksLikeAccessorLine(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, ".get(\"authorization\")") != null or
+        std.mem.indexOf(u8, line, ".get(\"token\")") != null or
+        std.mem.indexOf(u8, line, ".headers.get(") != null;
 }
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -644,8 +857,9 @@ fn renderText(allocator: Allocator, report: Report, fail_on: FailureThreshold) !
     } else {
         try buf.appendSlice(allocator, "\n");
         for (report.findings) |finding| {
-            try appendFmt(&buf, allocator, "[{s}] {s}:{d} {s}\n", .{
+            try appendFmt(&buf, allocator, "[{s}/{s}] {s}:{d} {s}\n", .{
                 finding.severity.toString(),
+                finding.confidence.toString(),
                 finding.path,
                 finding.line orelse 0,
                 finding.rule,
@@ -698,6 +912,8 @@ fn renderJson(allocator: Allocator, report: Report, fail_on: FailureThreshold) !
         try buf.appendSlice(allocator, "{");
         try json_util.appendJsonKeyValue(&buf, allocator, "severity", finding.severity.toString());
         try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "confidence", finding.confidence.toString());
+        try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "rule", finding.rule);
         try buf.appendSlice(allocator, ",");
         try json_util.appendJsonKeyValue(&buf, allocator, "path", finding.path);
@@ -743,7 +959,91 @@ test "workspace audit finds env secret assignment" {
 
     try std.testing.expectEqual(@as(usize, 1), report.findings.len);
     try std.testing.expectEqual(Severity.high, report.findings[0].severity);
+    try std.testing.expectEqual(Confidence.high, report.findings[0].confidence);
     try std.testing.expectEqualStrings(".env", report.findings[0].path);
+}
+
+test "workspace audit ignores code variable token assignment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "build.zig",
+        .data = "const token = std.mem.trim(u8, token_raw, \" \\t\\r\\n\");\n",
+    });
+
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var report = try buildReport(std.testing.allocator, workspace, .{
+        .workspace_dir = workspace,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), report.findings.len);
+}
+
+test "workspace audit excludes requested paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = ".env",
+        .data = "API_KEY=sk-live-1234567890abcdef\n",
+    });
+
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var report = try buildReport(std.testing.allocator, workspace, .{
+        .workspace_dir = workspace,
+        .exclude_patterns = &.{".env"},
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), report.findings.len);
+}
+
+test "workspace audit only secrets hides medium findings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "notes.txt",
+        .data = "secret: abcdef1234567890\n",
+    });
+
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var report = try buildReport(std.testing.allocator, workspace, .{
+        .workspace_dir = workspace,
+        .only_secrets = true,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), report.findings.len);
+}
+
+test "workspace audit ignores vendored paths by default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std_compat.fs.Dir.wrap(tmp.dir).makePath("zig-pkg/pkg");
+    try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
+        .sub_path = "zig-pkg/pkg/README.md",
+        .data = "token=ghp_abcd1234567890secret\n",
+    });
+
+    const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var report = try buildReport(std.testing.allocator, workspace, .{
+        .workspace_dir = workspace,
+    });
+    defer report.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), report.findings.len);
 }
 
 fn gitAvailable(allocator: Allocator) bool {
@@ -800,6 +1100,7 @@ test "failure threshold none never fails" {
     var findings = try std.testing.allocator.alloc(Finding, 1);
     findings[0] = Finding{
         .severity = .critical,
+        .confidence = .high,
         .rule = try std.testing.allocator.dupe(u8, "private_key_block"),
         .path = try std.testing.allocator.dupe(u8, ".env"),
         .line = 1,
