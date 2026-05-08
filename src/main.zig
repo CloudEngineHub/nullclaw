@@ -1675,8 +1675,8 @@ fn printMemoryUsage() void {
         \\                                Show a single memory entry by key
         \\  list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]
         \\                                List memory entries (default limit: 20)
-        \\  export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--redact-pii]
-        \\                                Export memory entries as JSONL (default limit: 1000)
+        \\  export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--include-pii]
+        \\                                Export redacted memory entries as JSONL (default limit: 1000)
         \\  hygiene-report [--category C] [--limit N] [--session ID] [--include-internal] [--json]
         \\                                Dry-run duplicate/near-duplicate memory report
         \\  store <key> <content> [--category C] [--session ID] [--json]
@@ -2028,6 +2028,52 @@ fn memoryEntryVisible(include_internal: bool, entry: yc.memory.MemoryEntry) bool
     return include_internal or !yc.memory.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
 }
 
+fn cloneMemoryCategory(allocator: std.mem.Allocator, category: yc.memory.MemoryCategory) !yc.memory.MemoryCategory {
+    return switch (category) {
+        .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+        else => category,
+    };
+}
+
+fn cloneMemoryEntry(allocator: std.mem.Allocator, entry: yc.memory.MemoryEntry) !yc.memory.MemoryEntry {
+    const id = try allocator.dupe(u8, entry.id);
+    errdefer allocator.free(id);
+    const key = try allocator.dupe(u8, entry.key);
+    errdefer allocator.free(key);
+    const content = try allocator.dupe(u8, entry.content);
+    errdefer allocator.free(content);
+    const timestamp = try allocator.dupe(u8, entry.timestamp);
+    errdefer allocator.free(timestamp);
+    const session_id = if (entry.session_id) |sid| try allocator.dupe(u8, sid) else null;
+    errdefer if (session_id) |sid| allocator.free(sid);
+    const category = try cloneMemoryCategory(allocator, entry.category);
+    errdefer switch (category) {
+        .custom => |name| allocator.free(name),
+        else => {},
+    };
+    return .{
+        .id = id,
+        .key = key,
+        .content = content,
+        .category = category,
+        .timestamp = timestamp,
+        .session_id = session_id,
+        .score = entry.score,
+    };
+}
+
+fn appendClonedMemoryEntry(
+    allocator: std.mem.Allocator,
+    kept: *std.ArrayListUnmanaged(yc.memory.MemoryEntry),
+    entry: yc.memory.MemoryEntry,
+) !void {
+    var clone = try cloneMemoryEntry(allocator, entry);
+    kept.append(allocator, clone) catch |err| {
+        clone.deinit(allocator);
+        return err;
+    };
+}
+
 fn loadMemoryListPage(
     allocator: std.mem.Allocator,
     mem: yc.memory.Memory,
@@ -2043,7 +2089,7 @@ fn loadMemoryListPage(
 
     if (!mem.hasNativePagedList()) {
         const entries = try mem.list(allocator, category, session_id);
-        errdefer yc.memory.freeEntries(allocator, entries);
+        defer yc.memory.freeEntries(allocator, entries);
 
         var visible_seen: usize = 0;
         var kept: std.ArrayListUnmanaged(yc.memory.MemoryEntry) = .empty;
@@ -2054,21 +2100,16 @@ fn loadMemoryListPage(
 
         for (entries) |*entry| {
             if (!memoryEntryVisible(false, entry.*)) {
-                entry.deinit(allocator);
                 continue;
             }
             if (visible_seen < offset) {
                 visible_seen += 1;
-                entry.deinit(allocator);
                 continue;
             }
             if (kept.items.len < limit) {
-                try kept.append(allocator, entry.*);
-            } else {
-                entry.deinit(allocator);
+                try appendClonedMemoryEntry(allocator, &kept, entry.*);
             }
         }
-        allocator.free(entries);
         return kept.toOwnedSlice(allocator);
     }
 
@@ -2084,31 +2125,26 @@ fn loadMemoryListPage(
 
     while (kept.items.len < limit) {
         const page = try mem.listPaged(allocator, category, session_id, chunk_size, raw_offset);
+        defer yc.memory.freeEntries(allocator, page);
         if (page.len == 0) {
-            allocator.free(page);
             break;
         }
 
         for (page) |*entry| {
             if (!memoryEntryVisible(false, entry.*)) {
-                entry.deinit(allocator);
                 continue;
             }
             if (visible_seen < offset) {
                 visible_seen += 1;
-                entry.deinit(allocator);
                 continue;
             }
             if (kept.items.len < limit) {
-                try kept.append(allocator, entry.*);
-            } else {
-                entry.deinit(allocator);
+                try appendClonedMemoryEntry(allocator, &kept, entry.*);
             }
         }
 
         raw_offset += page.len;
         const short_page = page.len < chunk_size;
-        allocator.free(page);
         if (short_page) break;
     }
 
@@ -2135,7 +2171,7 @@ const MemoryExportOptions = struct {
     limit: usize = 1000,
     offset: usize = 0,
     include_internal: bool = false,
-    redact_pii: bool = false,
+    include_pii: bool = false,
 };
 
 const DuplicateStats = struct {
@@ -2196,21 +2232,20 @@ fn appendMemoryExportJsonl(
     out: anytype,
     allocator: std.mem.Allocator,
     entries: []const yc.memory.MemoryEntry,
-    redact_pii: bool,
+    include_pii: bool,
 ) !void {
-    if (redact_pii) {
+    if (include_pii) {
+        for (entries) |entry| {
+            try writeMemoryExportEntryJson(out, entry, entry.key, entry.content, entry.session_id);
+            try out.writeByte('\n');
+        }
+    } else {
         var redactor = yc.redaction.Redactor.init(allocator, .{});
         defer redactor.deinit();
         for (entries) |entry| {
             try writeRedactedMemoryExportEntryJson(out, allocator, &redactor, entry);
             try out.writeByte('\n');
         }
-        return;
-    }
-
-    for (entries) |entry| {
-        try writeMemoryExportEntryJson(out, entry, entry.key, entry.content, entry.session_id);
-        try out.writeByte('\n');
     }
 }
 
@@ -2230,7 +2265,7 @@ fn buildMemoryExportJsonl(
     );
     defer yc.memory.freeEntries(allocator, entries);
 
-    return yc.admin_output.renderBytes(allocator, appendMemoryExportJsonl, .{ allocator, entries, options.redact_pii });
+    return yc.admin_output.renderBytes(allocator, appendMemoryExportJsonl, .{ allocator, entries, options.include_pii });
 }
 
 fn freeStringUsizeMap(map: *std.StringHashMapUnmanaged(usize), allocator: std.mem.Allocator) void {
@@ -2900,7 +2935,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--redact-pii]\n", .{});
+                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--include-pii] [--redact-pii]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
@@ -2910,7 +2945,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--redact-pii]\n", .{});
+                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--include-pii] [--redact-pii]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
@@ -2920,22 +2955,24 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--redact-pii]\n", .{});
+                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--include-pii] [--redact-pii]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
                 options.category = yc.memory.MemoryCategory.fromString(sub_args[i]);
             } else if (std.mem.eql(u8, sub_args[i], "--session")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--redact-pii]\n", .{});
+                    std.debug.print("Usage: nullclaw memory export-jsonl [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--include-pii] [--redact-pii]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
                 options.session_id = sub_args[i];
             } else if (std.mem.eql(u8, sub_args[i], "--include-internal")) {
                 options.include_internal = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--include-pii")) {
+                options.include_pii = true;
             } else if (std.mem.eql(u8, sub_args[i], "--redact-pii")) {
-                options.redact_pii = true;
+                options.include_pii = false;
             } else {
                 std.debug.print("Unknown option for memory export-jsonl: {s}\n", .{sub_args[i]});
                 std_compat.process.exit(1);
@@ -6370,7 +6407,6 @@ test "buildMemoryExportJsonl redacts PII and excludes internal entries by defaul
 
     const jsonl = try buildMemoryExportJsonl(std.testing.allocator, mem, .{
         .limit = 10,
-        .redact_pii = true,
     });
     defer std.testing.allocator.free(jsonl);
 
@@ -6380,6 +6416,43 @@ test "buildMemoryExportJsonl redacts PII and excludes internal entries by defaul
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "\"content\":\"Email [EMAIL_1]\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "\"session_id\":\"s-1\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, jsonl, "\n"));
+}
+
+test "buildMemoryExportJsonl include_pii returns raw content only when explicit" {
+    var impl_ = yc.memory.InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer impl_.deinit();
+    const mem = impl_.memory();
+
+    try mem.store("profile", "Email user@example.com", .conversation, "s-1");
+
+    const jsonl = try buildMemoryExportJsonl(std.testing.allocator, mem, .{
+        .limit = 10,
+        .include_pii = true,
+    });
+    defer std.testing.allocator.free(jsonl);
+
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "user@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "[EMAIL_1]") == null);
+}
+
+fn memoryExportAllocationTest(allocator: std.mem.Allocator) !void {
+    var impl_ = yc.memory.InMemoryLruMemory.init(allocator, 100);
+    defer impl_.deinit();
+    const mem = impl_.memory();
+
+    try mem.store("profile", "Email user@example.com", .conversation, "s-1");
+    try mem.store("profile-copy", "Email user@example.com", .conversation, "s-1");
+
+    const jsonl = buildMemoryExportJsonl(allocator, mem, .{ .limit = 10 }) catch |err| switch (err) {
+        // std.Io.Writer.Allocating wraps allocation failures as WriteFailed.
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer allocator.free(jsonl);
+}
+
+test "buildMemoryExportJsonl handles allocation failures without leaks" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, memoryExportAllocationTest, .{});
 }
 
 test "buildMemoryExportJsonl can include internal entries when requested" {
@@ -6397,6 +6470,24 @@ test "buildMemoryExportJsonl can include internal entries when requested" {
 
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "__bootstrap.prompt.AGENTS.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "\"content\":\"Bootstrap prompt\"") != null);
+}
+
+fn memoryHygieneAllocationTest(allocator: std.mem.Allocator) !void {
+    var impl_ = yc.memory.InMemoryLruMemory.init(allocator, 100);
+    defer impl_.deinit();
+    const mem = impl_.memory();
+
+    try mem.store("exact-a", "duplicate fact", .conversation, "s-1");
+    try mem.store("exact-b", "duplicate fact", .conversation, "s-1");
+    try mem.store("near-a", "  Case   Folded Fact  ", .conversation, "s-1");
+    try mem.store("near-b", "case folded fact", .conversation, "s-1");
+
+    const report = try buildMemoryHygieneDryRunReport(allocator, mem, .{ .limit = 10 });
+    _ = report;
+}
+
+test "buildMemoryHygieneDryRunReport handles allocation failures without leaks" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, memoryHygieneAllocationTest, .{});
 }
 
 test "buildMemoryHygieneDryRunReport counts exact and normalized duplicates without mutation" {

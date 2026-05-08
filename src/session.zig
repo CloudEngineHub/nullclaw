@@ -1536,11 +1536,18 @@ pub const SessionManager = struct {
 
     const StreamAdapterCtx = struct {
         sink: streaming.Sink,
+        suppress_live: bool = false,
     };
 
     fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
         const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (adapter.suppress_live and !chunk.is_final) return;
         streaming.forwardProviderChunk(adapter.sink, chunk);
+    }
+
+    fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8) bool {
+        const r = redactor orelse return false;
+        return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
     }
 
     fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
@@ -1823,7 +1830,8 @@ pub const SessionManager = struct {
 
         var stream_adapter: StreamAdapterCtx = undefined;
         if (stream_sink) |sink| {
-            stream_adapter = .{ .sink = sink };
+            const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content);
+            stream_adapter = .{ .sink = sink, .suppress_live = suppress_live };
             session.agent.stream_callback = streamChunkForwarder;
             session.agent.stream_ctx = @ptrCast(&stream_adapter);
         } else {
@@ -1934,6 +1942,14 @@ pub const SessionManager = struct {
                     if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
+        }
+
+        if (session.agent.redactor) |r| {
+            if (r.wouldRehydrate()) {
+                const display_response = try r.unredact(self.allocator, response);
+                self.allocator.free(response);
+                return display_response;
+            }
         }
 
         return response;
@@ -4161,6 +4177,55 @@ test "processMessageStreaming forwards provider deltas" {
 
     try testing.expectEqualStrings("streaming reply", resp);
     try testing.expectEqualStrings("streaming reply", collector.data.items);
+}
+
+test "processMessageStreaming suppresses redacted chunks and returns display response" {
+    var mock = MockStreamingProvider{ .response = "sent to [EMAIL_1]" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const session_key = "stream:redaction";
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "please email alice@example.com",
+        null,
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+        null,
+    );
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqualStrings("sent to alice@example.com", resp);
+    try testing.expectEqualStrings("", collector.data.items);
+
+    const detailed = try sqlite_mem.sessionStore().loadMessagesDetailed(testing.allocator, session_key, 10, 0);
+    defer memory_mod.freeDetailedMessages(testing.allocator, detailed);
+    try testing.expectEqual(@as(usize, 2), detailed.len);
+    for (detailed) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content, "alice@example.com") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
 }
 
 test "processMessageStreaming forwards tool progress hints" {

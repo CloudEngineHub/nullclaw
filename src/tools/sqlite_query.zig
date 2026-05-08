@@ -12,6 +12,7 @@ const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const path_security = @import("path_security.zig");
+const redaction = @import("../redaction.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -35,10 +36,10 @@ pub const SqliteQueryTool = struct {
     pub const tool_description =
         "Run a read-only SQL query against a SQLite database in the workspace. " ++
         "Only SELECT, WITH, and PRAGMA table_info statements are permitted. " ++
-        "Returns a JSON object {columns, rows, row_count, truncated}. " ++
+        "Returns a PII-redacted JSON object {columns, rows, row_count, truncated}. " ++
         "Bounded by max_rows and an internal byte cap. Multi-statement input is rejected.";
     pub const tool_params =
-        \\{"type":"object","properties":{"db_path":{"type":"string","description":"Workspace-relative path to the .db file."},"query":{"type":"string","description":"Single SELECT/WITH/PRAGMA table_info statement (no semicolons mid-stream)."},"max_rows":{"type":"integer","description":"Optional row cap (1..1000). Default: 1000."}},"required":["db_path","query"]}
+        \\{"type":"object","properties":{"db_path":{"type":"string","description":"Workspace-relative path to the .db file."},"query":{"type":"string","description":"Single SELECT/WITH/PRAGMA table_info statement (no semicolons mid-stream)."},"max_rows":{"type":"integer","description":"Optional row cap (1..1000). Default: 1000."},"include_sensitive":{"type":"boolean","description":"Return raw sensitive values instead of redacted placeholders. Default: false."}},"required":["db_path","query"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -69,6 +70,7 @@ pub const SqliteQueryTool = struct {
             }
             break :blk self.max_result_rows;
         };
+        const include_sensitive = root.getBool(args, "include_sensitive") orelse false;
 
         // Layer 1a: path safety (rejects absolute, traversal, null bytes).
         //
@@ -134,7 +136,7 @@ pub const SqliteQueryTool = struct {
             return failOwned(allocator, "statement is not read-only (sqlite3_stmt_readonly check)");
         }
 
-        return try renderRows(allocator, stmt.?, max_rows, self.max_result_bytes);
+        return try renderRows(allocator, stmt.?, max_rows, self.max_result_bytes, include_sensitive);
     }
 };
 
@@ -231,26 +233,79 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
 // Row rendering
 // ════════════════════════════════════════════════════════════════════════════
 
-fn renderRows(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, max_rows: u32, max_bytes: usize) !ToolResult {
+const RESULT_FOOTER_RESERVE: usize = 96;
+
+fn appendBoundedSlice(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    max_bytes: usize,
+    s: []const u8,
+) !void {
+    if (out.items.len + s.len > max_bytes) return error.OutputLimitExceeded;
+    try out.appendSlice(allocator, s);
+}
+
+fn appendBoundedByte(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    max_bytes: usize,
+    b: u8,
+) !void {
+    if (out.items.len + 1 > max_bytes) return error.OutputLimitExceeded;
+    try out.append(allocator, b);
+}
+
+fn renderTruncatedEmptyRows(allocator: std.mem.Allocator) !ToolResult {
+    return .{
+        .success = true,
+        .output = try allocator.dupe(u8, "{\"columns\":[],\"rows\":[],\"row_count\":0,\"truncated\":true}"),
+    };
+}
+
+fn renderTruncatedAfterDeinit(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !ToolResult {
+    out.deinit(allocator);
+    return renderTruncatedEmptyRows(allocator);
+}
+
+fn renderRows(
+    allocator: std.mem.Allocator,
+    stmt: *c.sqlite3_stmt,
+    max_rows: u32,
+    max_bytes: usize,
+    include_sensitive: bool,
+) !ToolResult {
     const col_count: usize = @intCast(c.sqlite3_column_count(stmt));
+    const row_budget = if (max_bytes > RESULT_FOOTER_RESERVE) max_bytes - RESULT_FOOTER_RESERVE else max_bytes;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    try out.appendSlice(allocator, "{\"columns\":[");
+    appendBoundedSlice(allocator, &out, row_budget, "{\"columns\":[") catch |err| switch (err) {
+        error.OutputLimitExceeded => return renderTruncatedAfterDeinit(allocator, &out),
+        else => return err,
+    };
     var ci: usize = 0;
     while (ci < col_count) : (ci += 1) {
-        if (ci > 0) try out.append(allocator, ',');
+        if (ci > 0) appendBoundedByte(allocator, &out, row_budget, ',') catch |err| switch (err) {
+            error.OutputLimitExceeded => return renderTruncatedAfterDeinit(allocator, &out),
+            else => return err,
+        };
         const name_raw = c.sqlite3_column_name(stmt, @intCast(ci));
         const name = if (name_raw == null) "" else std.mem.span(name_raw);
-        try appendJsonString(allocator, &out, name);
+        appendJsonStringBounded(allocator, &out, row_budget, name) catch |err| switch (err) {
+            error.OutputLimitExceeded => return renderTruncatedAfterDeinit(allocator, &out),
+            else => return err,
+        };
     }
-    try out.appendSlice(allocator, "],\"rows\":[");
+    appendBoundedSlice(allocator, &out, row_budget, "],\"rows\":[") catch |err| switch (err) {
+        error.OutputLimitExceeded => return renderTruncatedAfterDeinit(allocator, &out),
+        else => return err,
+    };
 
     var row_count: u32 = 0;
     var truncated = false;
 
-    while (true) {
+    row_loop: while (true) {
         const rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_DONE) break;
         if (rc != c.SQLITE_ROW) {
@@ -275,14 +330,50 @@ fn renderRows(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, max_rows: u32
         // per-row check only, and one giant cell could blow the cap by
         // arbitrary margin.
         const row_start_len = out.items.len;
-        if (row_count > 0) try out.append(allocator, ',');
-        try out.append(allocator, '[');
+        if (row_count > 0) appendBoundedByte(allocator, &out, row_budget, ',') catch |err| switch (err) {
+            error.OutputLimitExceeded => {
+                truncated = true;
+                break :row_loop;
+            },
+            else => return err,
+        };
+        appendBoundedByte(allocator, &out, row_budget, '[') catch |err| switch (err) {
+            error.OutputLimitExceeded => {
+                out.items.len = row_start_len;
+                truncated = true;
+                break :row_loop;
+            },
+            else => return err,
+        };
         var col: c_int = 0;
         while (col < @as(c_int, @intCast(col_count))) : (col += 1) {
-            if (col > 0) try out.append(allocator, ',');
-            try appendCellAsJson(allocator, &out, stmt, col);
+            if (col > 0) appendBoundedByte(allocator, &out, row_budget, ',') catch |err| switch (err) {
+                error.OutputLimitExceeded => {
+                    out.items.len = row_start_len;
+                    truncated = true;
+                    break :row_loop;
+                },
+                else => return err,
+            };
+            appendCellAsJson(allocator, &out, row_budget, stmt, col) catch |err| switch (err) {
+                error.OutputLimitExceeded => {
+                    out.items.len = row_start_len;
+                    truncated = true;
+                    break :row_loop;
+                },
+                else => return err,
+            };
+            if (truncated) break;
         }
-        try out.append(allocator, ']');
+        if (truncated) break;
+        appendBoundedByte(allocator, &out, row_budget, ']') catch |err| switch (err) {
+            error.OutputLimitExceeded => {
+                out.items.len = row_start_len;
+                truncated = true;
+                break :row_loop;
+            },
+            else => return err,
+        };
         if (out.items.len > max_bytes) {
             // Roll back this row entirely (including its leading comma).
             out.items.len = row_start_len;
@@ -292,81 +383,91 @@ fn renderRows(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, max_rows: u32
         row_count += 1;
     }
 
-    try out.appendSlice(allocator, "],\"row_count\":");
+    try appendBoundedSlice(allocator, &out, max_bytes, "],\"row_count\":");
     var num_buf: [32]u8 = undefined;
     const rc_str = try std.fmt.bufPrint(&num_buf, "{d}", .{row_count});
-    try out.appendSlice(allocator, rc_str);
-    try out.appendSlice(allocator, ",\"truncated\":");
-    try out.appendSlice(allocator, if (truncated) "true" else "false");
-    try out.append(allocator, '}');
+    try appendBoundedSlice(allocator, &out, max_bytes, rc_str);
+    try appendBoundedSlice(allocator, &out, max_bytes, ",\"truncated\":");
+    try appendBoundedSlice(allocator, &out, max_bytes, if (truncated) "true" else "false");
+    try appendBoundedByte(allocator, &out, max_bytes, '}');
 
-    return ToolResult{ .success = true, .output = try out.toOwnedSlice(allocator) };
+    const rendered = try out.toOwnedSlice(allocator);
+    if (include_sensitive) {
+        return ToolResult{ .success = true, .output = rendered };
+    }
+    var r = redaction.Redactor.init(allocator, .{});
+    defer r.deinit();
+    const redacted = try r.redact(allocator, rendered);
+    allocator.free(rendered);
+    return ToolResult{ .success = true, .output = redacted };
 }
 
 fn appendCellAsJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
+    max_bytes: usize,
     stmt: *c.sqlite3_stmt,
     col: c_int,
 ) !void {
     const col_type = c.sqlite3_column_type(stmt, col);
     switch (col_type) {
-        c.SQLITE_NULL => try out.appendSlice(allocator, "null"),
+        c.SQLITE_NULL => try appendBoundedSlice(allocator, out, max_bytes, "null"),
         c.SQLITE_INTEGER => {
             const v = c.sqlite3_column_int64(stmt, col);
             var buf: [32]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "{d}", .{v});
-            try out.appendSlice(allocator, s);
+            try appendBoundedSlice(allocator, out, max_bytes, s);
         },
         c.SQLITE_FLOAT => {
             const v = c.sqlite3_column_double(stmt, col);
             var buf: [64]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "{d}", .{v});
-            try out.appendSlice(allocator, s);
+            try appendBoundedSlice(allocator, out, max_bytes, s);
         },
         c.SQLITE_TEXT => {
             const raw = c.sqlite3_column_text(stmt, col);
             const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
             const slice = if (raw == null) ""[0..] else @as([*]const u8, @ptrCast(raw))[0..len];
-            try appendJsonString(allocator, out, slice);
+            try appendJsonStringBounded(allocator, out, max_bytes, slice);
         },
         c.SQLITE_BLOB => {
             const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
-            try out.appendSlice(allocator, "\"<blob:");
+            try appendBoundedSlice(allocator, out, max_bytes, "\"<blob:");
             var buf: [32]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "{d}", .{len});
-            try out.appendSlice(allocator, s);
-            try out.appendSlice(allocator, ">\"");
+            try appendBoundedSlice(allocator, out, max_bytes, s);
+            try appendBoundedSlice(allocator, out, max_bytes, ">\"");
         },
-        else => try out.appendSlice(allocator, "null"),
+        else => try appendBoundedSlice(allocator, out, max_bytes, "null"),
     }
 }
 
-fn appendJsonString(
+fn appendJsonStringBounded(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
+    max_bytes: usize,
     s: []const u8,
 ) !void {
-    try out.append(allocator, '"');
+    try appendBoundedByte(allocator, out, max_bytes, '"');
     for (s) |ch| {
         switch (ch) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
+            '"' => try appendBoundedSlice(allocator, out, max_bytes, "\\\""),
+            '\\' => try appendBoundedSlice(allocator, out, max_bytes, "\\\\"),
+            '\n' => try appendBoundedSlice(allocator, out, max_bytes, "\\n"),
+            '\r' => try appendBoundedSlice(allocator, out, max_bytes, "\\r"),
+            '\t' => try appendBoundedSlice(allocator, out, max_bytes, "\\t"),
             else => {
                 if (ch < 0x20) {
                     var buf: [8]u8 = undefined;
                     const formatted = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch});
-                    try out.appendSlice(allocator, formatted);
+                    try appendBoundedSlice(allocator, out, max_bytes, formatted);
                 } else {
-                    try out.append(allocator, ch);
+                    try appendBoundedByte(allocator, out, max_bytes, ch);
                 }
             },
         }
     }
-    try out.append(allocator, '"');
+    try appendBoundedByte(allocator, out, max_bytes, '"');
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -422,6 +523,49 @@ const TestDb = struct {
             var buf: [128]u8 = undefined;
             const sql = try std.fmt.bufPrintZ(&buf, "INSERT INTO big VALUES ({d}, 'row{d}');", .{ i, i });
             if (c.sqlite3_exec(db, sql.ptr, null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
+        }
+    }
+
+    fn populateSensitive(path: [*:0]const u8) !void {
+        var db: ?*c.sqlite3 = null;
+        const rc = c.sqlite3_open(path, &db);
+        if (rc != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return error.OpenFailed;
+        }
+        defer _ = c.sqlite3_close(db);
+        const sql =
+            "CREATE TABLE sensitive (email TEXT, card TEXT, api_token TEXT);" ++
+            "INSERT INTO sensitive VALUES ('alice@example.com', '4111 1111 1111 1111', 'api_key=sk-live-secret');";
+        if (c.sqlite3_exec(db, sql, null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
+    }
+
+    fn populateHugeText(path: [*:0]const u8, allocator: std.mem.Allocator, len: usize) !void {
+        var db: ?*c.sqlite3 = null;
+        const rc = c.sqlite3_open(path, &db);
+        if (rc != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return error.OpenFailed;
+        }
+        defer _ = c.sqlite3_close(db);
+        if (c.sqlite3_exec(db, "CREATE TABLE huge (payload TEXT);", null, null, null) != c.SQLITE_OK) {
+            return error.PopulateFailed;
+        }
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db, "INSERT INTO huge VALUES (?1)", -1, &stmt, null) != c.SQLITE_OK) {
+            return error.PopulateFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        const big = try allocator.alloc(u8, len);
+        defer allocator.free(big);
+        @memset(big, 'A');
+        if (c.sqlite3_bind_text(stmt, 1, big.ptr, @intCast(big.len), SQLITE_STATIC) != c.SQLITE_OK) {
+            return error.PopulateFailed;
+        }
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
+            return error.PopulateFailed;
         }
     }
 };
@@ -619,6 +763,53 @@ test "sqlite_query: respects max_rows cap (truncated=true)" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":true") != null);
 }
 
+test "sqlite_query: redacts sensitive result values by default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/sensitive.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populateSensitive(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"sensitive.db\",\"query\":\"SELECT email, card, api_token FROM sensitive\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "4111 1111 1111 1111") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "sk-live-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[CARD_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[TOKEN_1]") != null);
+}
+
+test "sqlite_query: include_sensitive returns raw result values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/sensitive.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populateSensitive(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"sensitive.db\",\"query\":\"SELECT email, card, api_token FROM sensitive\",\"include_sensitive\":true}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "alice@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "4111 1111 1111 1111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "sk-live-secret") != null);
+}
+
 test "sqlite_query: invalid db_path (traversal) rejected" {
     const allocator = std.testing.allocator;
     var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_sqlite_query_traversal" };
@@ -696,6 +887,7 @@ test "sqlite_query: tool metadata sanity" {
     try std.testing.expect(t.parametersJson().len > 0);
     try std.testing.expect(std.mem.indexOf(u8, t.parametersJson(), "db_path") != null);
     try std.testing.expect(std.mem.indexOf(u8, t.parametersJson(), "query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.parametersJson(), "include_sensitive") != null);
 }
 
 test "classifyStatement: rejects empty" {
@@ -792,6 +984,38 @@ test "sqlite_query: max_bytes cap rolls back oversized row" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"row_count\":0") != null);
     // Output stays well under twice the cap (some JSON skeleton overhead is fine).
     try std.testing.expect(result.output.len < 2048);
+}
+
+test "sqlite_query: huge text and aliases stay within max_result_bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/huge.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populateHugeText(db_path_z.ptr, std.testing.allocator, 100_000);
+
+    const alias = try std.testing.allocator.alloc(u8, 2048);
+    defer std.testing.allocator.free(alias);
+    @memset(alias, 'A');
+    const query = try std.fmt.allocPrint(std.testing.allocator, "SELECT payload AS '{s}' FROM huge", .{alias});
+    defer std.testing.allocator.free(query);
+    const args_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"db_path\":\"huge.db\",\"query\":\"{s}\"}}", .{query});
+    defer std.testing.allocator.free(args_json);
+
+    var sqt = SqliteQueryTool{
+        .workspace_dir = ws_path,
+        .max_result_bytes = 512,
+    };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(args_json);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(result.output.len <= 512);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":true") != null);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

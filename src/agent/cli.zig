@@ -31,6 +31,7 @@ const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
+const redaction = @import("../redaction.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
@@ -66,13 +67,31 @@ fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
 }
 
+fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8) bool {
+    const r = redactor orelse return false;
+    return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
+}
+
 fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
     const store = agent.session_store orelse return;
     const session_key = agent.memory_session_id orelse return;
+
+    const persisted_content = if (agent.redactor) |r|
+        r.redact(agent.allocator, content) catch null
+    else
+        null;
+    defer if (persisted_content) |text| agent.allocator.free(text);
+
+    const persisted_response = if (agent.redactor) |r|
+        r.redact(agent.allocator, response) catch null
+    else
+        null;
+    defer if (persisted_response) |text| agent.allocator.free(text);
+
     turn_persistence.persistTurn(store, .{
         .history = agent.history.items,
         .total_tokens = agent.total_tokens,
-    }, session_key, content, response);
+    }, session_key, persisted_content orelse content, persisted_response orelse response);
 }
 
 fn printPendingSubagentNotices(
@@ -563,7 +582,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Enable streaming if provider supports it
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
-            .suppress_live = if (agent.redactor) |r| r.wouldRehydrate() else false,
+            .suppress_live = shouldSuppressLiveForRedaction(agent.redactor, message),
         };
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,
@@ -687,7 +706,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Enable streaming if provider supports it
     var stream_ctx = CliStreamCtx{
         .sink = undefined,
-        .suppress_live = if (agent.redactor) |r| r.wouldRehydrate() else false,
+        .suppress_live = false,
     };
     const raw_stream_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
@@ -745,6 +764,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         repl_history.append(allocator, allocator.dupe(u8, debounced_input.current) catch continue) catch {};
 
         stream_ctx.emitted_text = false;
+        stream_ctx.suppress_live = shouldSuppressLiveForRedaction(agent.redactor, debounced_input.current);
         const response = agent.turn(debounced_input.current) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -1055,6 +1075,49 @@ test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
 
 test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
     try std.testing.expect(!shouldPrintTurnResponse(true, true));
+}
+
+test "persistCliTurn redacts PII before session persistence" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = mem.sessionStore(),
+        .memory_session_id = "cli-redaction-session",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .redactor = &redactor,
+    };
+    defer {
+        agent.redactor = null;
+        agent.deinit();
+    }
+
+    persistCliTurn(&agent, "contact alice@example.com", "sent to alice@example.com");
+
+    const detailed = try mem.sessionStore().loadMessagesDetailed(allocator, "cli-redaction-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
 }
 
 test "parseAgentArgs keeps the last override value" {

@@ -24,6 +24,7 @@ const query_expansion_mod = @import("query_expansion.zig");
 const adaptive_mod = @import("adaptive.zig");
 const llm_reranker_mod = @import("llm_reranker.zig");
 const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
+const redaction = @import("../../redaction.zig");
 const log = std.log.scoped(.retrieval);
 
 // ── Pipeline stage ordering ──────────────────────────────────────
@@ -50,6 +51,12 @@ pub const RetrievalStage = enum {
     /// Stage 8: Final limit/truncation
     limit,
 };
+
+fn redactForEmbedding(allocator: Allocator, text: []const u8) ![]u8 {
+    var r = redaction.Redactor.init(allocator, .{});
+    defer r.deinit();
+    return r.redact(allocator, text);
+}
 
 /// The canonical pipeline order. All stages execute in this sequence.
 pub const pipeline_order = [_]RetrievalStage{
@@ -434,8 +441,14 @@ pub const RetrievalEngine = struct {
                 }
             }
 
+            const safe_query = redactForEmbedding(allocator, query) catch |err| {
+                log.warn("query redaction failed, skipping vector search: {}", .{err});
+                break :hybrid_blk;
+            };
+            defer allocator.free(safe_query);
+
             // Embed query
-            const query_embedding = provider.embed(allocator, query) catch |err| {
+            const query_embedding = provider.embed(allocator, safe_query) catch |err| {
                 log.warn("query embedding failed, degrading to keyword-only: {}", .{err});
                 if (self.circuit_breaker) |cb| cb.recordFailure();
                 break :hybrid_blk;
@@ -1079,6 +1092,108 @@ test "Engine with hybrid disabled stays keyword-only" {
     const results = try engine.search(allocator, "test", null);
     defer freeCandidates(allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "Engine hybrid search redacts query before embedding" {
+    const allocator = std.testing.allocator;
+
+    const CaptureEmbedding = struct {
+        last_text: ?[]u8 = null,
+        alloc: Allocator,
+
+        const vtable = embeddings_mod.EmbeddingProvider.VTable{
+            .name = name,
+            .dimensions = dimensions,
+            .embed = embed,
+            .deinit = deinit,
+        };
+
+        fn provider(self: *@This()) embeddings_mod.EmbeddingProvider {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn name(_: *anyopaque) []const u8 {
+            return "capture";
+        }
+
+        fn dimensions(_: *anyopaque) u32 {
+            return 1;
+        }
+
+        fn embed(ptr: *anyopaque, alloc: Allocator, text: []const u8) anyerror![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.last_text) |old| self.alloc.free(old);
+            self.last_text = try self.alloc.dupe(u8, text);
+            const out = try alloc.alloc(f32, 1);
+            out[0] = 1.0;
+            return out;
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const StaticVectorStore = struct {
+        key: []const u8,
+
+        const vtable = vector_store_mod.VectorStore.VTable{
+            .upsert = upsert,
+            .search = search,
+            .delete = delete,
+            .count = count,
+            .health_check = healthCheck,
+            .deinit = deinit,
+        };
+
+        fn store(self: *@This()) vector_store_mod.VectorStore {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn upsert(_: *anyopaque, _: []const u8, _: []const f32) anyerror!void {}
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn count(_: *anyopaque) anyerror!usize {
+            return 1;
+        }
+        fn healthCheck(_: *anyopaque, _: Allocator) anyerror!vector_store_mod.HealthStatus {
+            return .{ .ok = true, .latency_ns = 0, .entry_count = 1, .error_msg = null };
+        }
+        fn deinit(_: *anyopaque) void {}
+
+        fn search(ptr: *anyopaque, alloc: Allocator, _: []const f32, limit: u32) anyerror![]vector_store_mod.VectorResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (limit == 0) return alloc.alloc(vector_store_mod.VectorResult, 0);
+            const out = try alloc.alloc(vector_store_mod.VectorResult, 1);
+            out[0] = .{ .key = try alloc.dupe(u8, self.key), .score = 0.9 };
+            return out;
+        }
+    };
+
+    var backend = none_mod.NoneMemory.init();
+    defer backend.deinit();
+    var pa = PrimaryAdapter.init(backend.memory());
+
+    var embed_impl = CaptureEmbedding{ .alloc = allocator };
+    defer if (embed_impl.last_text) |text| allocator.free(text);
+
+    const encoded_key = try key_codec.encode(allocator, "memory-key", null);
+    defer allocator.free(encoded_key);
+    var vector_impl = StaticVectorStore{ .key = encoded_key };
+
+    var engine = RetrievalEngine.init(allocator, .{});
+    defer engine.deinit();
+    try engine.addSource(pa.adapter());
+    engine.setVectorSearch(embed_impl.provider(), vector_impl.store(), null, .{
+        .enabled = true,
+        .candidate_multiplier = 1,
+    });
+
+    const results = try engine.search(allocator, "find alice@example.com token=abc/def+ghi==", null);
+    defer freeCandidates(allocator, results);
+
+    try std.testing.expect(embed_impl.last_text != null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_impl.last_text.?, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_impl.last_text.?, "abc/def+ghi==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_impl.last_text.?, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, embed_impl.last_text.?, "[TOKEN_1]") != null);
 }
 
 test "Engine.setVectorSearch stores fields" {

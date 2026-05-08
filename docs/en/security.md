@@ -45,9 +45,11 @@ and vector embedding sync.
 The reusable redactor defaults to one-way operation: it keys values by
 HMAC-SHA256 fingerprints and does not retain the original plaintext. The agent
 uses an opt-in in-memory reverse map for its per-conversation redactor so it can
-rehydrate placeholders before tool execution and console display. That reverse
-map lives only in process RAM, is reset with the conversation, and is not written
-to memory, history, JSONL export, or diagnostics.
+rehydrate placeholders for user-facing display. Tool arguments keep literal
+placeholders by default; this prevents provider output from becoming a
+provider-to-tool exfiltration channel. The reverse map lives only in process
+RAM, is bounded, is reset with the conversation, and is not written to memory,
+history, JSONL export, or diagnostics.
 
 The redactor is a lightweight text scanner, not a full DLP/OCR engine. It covers
 common text forms for emails, phone numbers, Luhn-valid cards, anchored
@@ -59,8 +61,9 @@ this boundary unless another tool extracts them as text first.
 
 Use `nullclaw memory export-jsonl` when memory needs to become a DS artifact.
 The command emits JSONL with a stable schema and excludes bootstrap/autosave
-internal entries by default. Add `--redact-pii` before sending the export to a
-notebook, model-evaluation job, or reviewer outside the local trust boundary.
+internal entries by default. Content is PII-redacted by default. Use
+`--include-pii` only when exporting inside a trusted local boundary; the older
+`--redact-pii` flag is still accepted as a compatibility no-op.
 
 Use `nullclaw memory hygiene-report` before cleanup work. The command is always
 a dry run: it reports exact and normalized duplicate groups without deleting,

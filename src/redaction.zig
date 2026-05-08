@@ -12,8 +12,8 @@
 //! `Config.record_originals = true` opts the redactor into a parallel
 //! `placeholder_to_original` reverse map that retains plaintext PII for the
 //! lifetime of the Redactor. This unlocks `unredact()` for callers that need
-//! to rehydrate placeholders back to originals (e.g. tool-arg restoration,
-//! console rendering). Originals stay in process RAM; on-disk surfaces
+//! to rehydrate placeholders back to originals for user-facing display.
+//! Originals stay in process RAM within a bounded reverse map; on-disk surfaces
 //! (memory backend, history persistence) are not affected.
 
 const std = @import("std");
@@ -28,10 +28,12 @@ pub const Config = struct {
     /// If true, redact() also records original PII alongside the placeholder so
     /// later unredact() calls can rehydrate. Off by default — the one-way
     /// "HMAC-only" contract holds. Opt in when the same Redactor is used to
-    /// rehydrate tool args / display text within the agent process. Originals
-    /// then live in process RAM for the redactor's lifetime; on-disk state is
-    /// untouched.
+    /// rehydrate display text within the agent process. Originals then live in
+    /// process RAM for the redactor's lifetime; on-disk state is untouched.
     record_originals: bool = false,
+    /// Upper bound for plaintext originals retained for display rehydration.
+    /// Once the cap is reached, new placeholders remain one-way.
+    max_originals: u32 = 1024,
 };
 
 pub const Redactor = struct {
@@ -201,6 +203,10 @@ pub const Redactor = struct {
         return try out.toOwnedSlice(dest_allocator);
     }
 
+    pub fn wouldRedact(self: *Redactor, input: []const u8) bool {
+        return self.hasMatch(input);
+    }
+
     fn hasMatch(self: *Redactor, input: []const u8) bool {
         var i: usize = 0;
         while (i < input.len) : (i += 1) {
@@ -252,6 +258,7 @@ pub const Redactor = struct {
         var key_buf: [32]u8 = undefined;
         const key_slice = try std.fmt.bufPrint(&key_buf, "[{s}_{d}]", .{ kind, id });
         if (self.placeholder_to_original.get(key_slice)) |_| return;
+        if (self.config.max_originals == 0 or self.placeholder_to_original.count() >= self.config.max_originals) return;
 
         const key_dup = try self.allocator.dupe(u8, key_slice);
         errdefer self.allocator.free(key_dup);
@@ -260,12 +267,11 @@ pub const Redactor = struct {
         try self.placeholder_to_original.put(key_dup, value_dup);
     }
 
-    /// Whether this Redactor will substitute placeholders back to originals.
-    /// Callers (CLI display, tool-arg rehydration) gate downstream behavior
-    /// on this, so a future "redact-only" mode (record_originals=false) does
-    /// not silently break UX paths that assume `unredact()` is meaningful.
+    /// Whether this Redactor currently has originals to substitute back into
+    /// placeholders. Callers (for example CLI display) gate downstream behavior
+    /// on this, so plain turns without captured PII can still stream normally.
     pub fn wouldRehydrate(self: *const Redactor) bool {
-        return self.config.record_originals;
+        return self.config.record_originals and self.placeholder_to_original.count() > 0;
     }
 
     /// Replace `[EMAIL_N]` / `[PHONE_N]` / `[CARD_N]` / `[ID_N]` / `[TOKEN_N]`
@@ -381,7 +387,9 @@ fn digitsOnly(input: []const u8, buf: []u8) []const u8 {
 // ════════════════════════════════════════════════════════════════════════════
 
 fn isSecretChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == ':';
+    return std.ascii.isAlphanumeric(c) or
+        c == '-' or c == '_' or c == '.' or c == ':' or
+        c == '%' or c == '+' or c == '/' or c == '=';
 }
 
 fn tokenEnd(input: []const u8, from: usize) usize {
@@ -437,9 +445,12 @@ const KeyValueMatch = struct { value_start: usize, value_end: usize };
 
 fn matchKeyValueSecret(input: []const u8, pos: usize) ?KeyValueMatch {
     const keywords = [_][]const u8{
-        "api_key", "api-key",    "apikey",
-        "token",   "password",   "passwd",
-        "secret",  "api_secret", "access_key",
+        "api_key",          "api-key",        "apikey",
+        "token",            "password",       "passwd",
+        "secret",           "api_secret",     "access_key",
+        "access_token",     "refresh_token",  "id_token",
+        "sig",              "signature",      "x-amz-signature",
+        "x-amz-credential", "awsaccesskeyid",
     };
     if (pos > 0) {
         const prev = input[pos - 1];
@@ -921,6 +932,24 @@ test "Redactor key-value secret redacted" {
     try std.testing.expectEqualStrings("api_key=[TOKEN_1]", out);
 }
 
+test "Redactor URL-style secret params redact full value" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "token=abc/def+ghi%2B==&access_token=ya29.a0+bc/def%2Fghi&sig=deadbeef");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("token=[TOKEN_1]&access_token=[TOKEN_2]&sig=[TOKEN_3]", out);
+}
+
+test "Redactor signed URL param names are treated as secrets" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "X-Amz-Signature=deadbeef&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/aws4_request&AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("X-Amz-Signature=[TOKEN_1]&X-Amz-Credential=[TOKEN_2]&AWSAccessKeyId=[TOKEN_3]", out);
+}
+
 test "Redactor Bearer token redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
@@ -1090,6 +1119,20 @@ test "unredact: reset clears reverse map" {
     defer allocator.free(after);
     // After reset the placeholder no longer resolves.
     try std.testing.expectEqualStrings("ping [EMAIL_1]", after);
+}
+
+test "unredact: max_originals bounds reverse map" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true, .max_originals = 1 });
+    defer r.deinit();
+
+    const redacted = try r.redact(allocator, "one a@b.co two x@y.zz");
+    defer allocator.free(redacted);
+    try std.testing.expectEqualStrings("one [EMAIL_1] two [EMAIL_2]", redacted);
+
+    const restored = try r.unredact(allocator, redacted);
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("one a@b.co two [EMAIL_2]", restored);
 }
 
 test "matchPlaceholderEnd: covers all kinds and rejects look-alikes" {

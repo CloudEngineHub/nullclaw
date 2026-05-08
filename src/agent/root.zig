@@ -557,9 +557,8 @@ pub const Agent = struct {
             if (!enabled) break :blk null;
             const r = try allocator.create(redaction.Redactor);
             errdefer allocator.destroy(r);
-            // record_originals=true so we can rehydrate placeholders before
-            // tool.execute() and before printing assistant replies to stdout.
-            // Originals stay in process RAM only; on-disk surface untouched.
+            // record_originals=true lets user-facing display paths restore
+            // placeholders while provider/tool/log/persistence boundaries stay redacted.
             r.* = redaction.Redactor.init(allocator, .{ .record_originals = true });
             break :blk r;
         };
@@ -2640,12 +2639,10 @@ pub const Agent = struct {
                     break :blk toolArgsObserverDetail(&tool_args_buf, safe_args);
                 } else null;
                 const tool_detail = if (self.log_llm_io) blk: {
-                    const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
-                    const safe_output = if (self.redactor) |r| r.redact(arena, scrubbed_output) catch scrubbed_output else scrubbed_output;
+                    const safe_output = self.safeToolDiagnosticText(arena, result.output);
                     break :blk toolResultObserverDetail(&tool_detail_buf, safe_output);
                 } else if (!result.success) blk: {
-                    const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
-                    break :blk if (self.redactor) |r| r.redact(arena, scrubbed_output) catch scrubbed_output else scrubbed_output;
+                    break :blk self.safeToolDiagnosticText(arena, result.output);
                 } else null;
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
@@ -2979,13 +2976,10 @@ pub const Agent = struct {
 
         for (self.tools) |t| {
             if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
-                // Parse arguments JSON to ObjectMap ONCE.
-                // `var` (not `const`) because unredactJsonValue mutates string
-                // nodes in-place when a Redactor is active. Note: `parsed`
-                // owns its own arena, so when unredact replaces a `.string`
-                // slice with a fresh allocation on `tool_allocator`, the
-                // parse arena's original slice remains reachable via
-                // `parsed.deinit()` and is still freed normally.
+                // Parse arguments JSON to ObjectMap ONCE. Placeholders are
+                // intentionally passed through unchanged; provider-bound
+                // redaction must not become an implicit provider-to-tool
+                // rehydration channel.
                 var parsed = std.json.parseFromSlice(
                     std.json.Value,
                     tool_allocator,
@@ -3000,27 +2994,6 @@ pub const Agent = struct {
                     };
                 };
                 defer parsed.deinit();
-
-                // Rehydrate any `[KIND_N]` placeholders the LLM passed back
-                // (e.g. `{"to":"[EMAIL_1]"}` from an outbound-redacted turn).
-                // Without this the tool would receive the literal placeholder
-                // string and any action-style tool (send_email, http_request,
-                // file_write, …) would fail or write meaningless data.
-                if (self.redactor) |r| {
-                    Agent.unredactJsonValue(tool_allocator, r, &parsed.value) catch |err| {
-                        const out_msg = std.fmt.allocPrint(
-                            tool_allocator,
-                            "Failed to rehydrate redacted placeholders in arguments: {s}",
-                            .{@errorName(err)},
-                        ) catch "Failed to rehydrate redacted placeholders in arguments";
-                        return .{
-                            .name = call.name,
-                            .output = out_msg,
-                            .success = false,
-                            .tool_call_id = call.tool_call_id,
-                        };
-                    };
-                }
 
                 const args: std.json.ObjectMap = switch (parsed.value) {
                     .object => |o| o,
@@ -3072,12 +3045,25 @@ pub const Agent = struct {
                 }
                 if (verbose_mod.isVerbose()) {
                     if (result.success) {
-                        const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
-                        log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                        const safe_output = self.safeToolDiagnosticText(tool_allocator, result.output);
+                        const output_preview = previewText(safe_output, 256);
+                        log.info("tool result: name={s} success={} output_len={d} output={s}{s}", .{
+                            call.name,
+                            result.success,
+                            result.output.len,
+                            output_preview.slice,
+                            if (output_preview.truncated) "..." else "",
+                        });
                     } else {
                         const error_msg = result.error_msg orelse result.output;
-                        const error_preview = if (error_msg.len > 256) error_msg[0..256] else error_msg;
-                        log.info("tool result: name={s} success={} error={s}", .{ call.name, result.success, error_preview });
+                        const safe_error = self.safeToolDiagnosticText(tool_allocator, error_msg);
+                        const error_preview = previewText(safe_error, 256);
+                        log.info("tool result: name={s} success={} error={s}{s}", .{
+                            call.name,
+                            result.success,
+                            error_preview.slice,
+                            if (error_preview.truncated) "..." else "",
+                        });
                     }
                 }
                 return .{
@@ -3116,11 +3102,52 @@ pub const Agent = struct {
         return r.redact(allocator, text) catch "[redaction failed]";
     }
 
+    fn safeToolDiagnosticText(self: *Agent, allocator: std.mem.Allocator, text: []const u8) []const u8 {
+        const scrubbed = providers.scrubToolOutput(allocator, text) catch text;
+        return self.diagnosticText(allocator, scrubbed);
+    }
+
     test "previewText keeps UTF-8 intact when truncating" {
         const preview = previewText("aaa\xd0\x99tail", 4);
         try std.testing.expectEqualStrings("aaa", preview.slice);
         try std.testing.expect(preview.truncated);
         try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
+    }
+
+    test "safeToolDiagnosticText scrubs PII and tokens" {
+        const allocator = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var redactor = redaction.Redactor.init(allocator, .{});
+        defer redactor.deinit();
+
+        var noop = observability.NoopObserver{};
+        var agent = Agent{
+            .allocator = allocator,
+            .provider = undefined,
+            .tools = &.{},
+            .tool_specs = try allocator.alloc(ToolSpec, 0),
+            .mem = null,
+            .observer = noop.observer(),
+            .model_name = "test-model",
+            .temperature = 0.7,
+            .workspace_dir = "/tmp",
+            .max_tool_iterations = 2,
+            .max_history_messages = 20,
+            .auto_save = false,
+            .history = .empty,
+            .redactor = &redactor,
+        };
+        defer {
+            agent.redactor = null;
+            agent.deinit();
+        }
+
+        const safe = agent.safeToolDiagnosticText(arena.allocator(), "row email=user@example.com api_key=sk-live-secret");
+        try std.testing.expect(std.mem.indexOf(u8, safe, "user@example.com") == null);
+        try std.testing.expect(std.mem.indexOf(u8, safe, "sk-live-secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, safe, "[EMAIL_1]") != null);
     }
 
     fn llmRequestObserverDetail(self: *Agent, allocator: std.mem.Allocator, buf: []u8, messages: []const ChatMessage) ?[]const u8 {
@@ -3571,7 +3598,7 @@ pub const Agent = struct {
             out[i] = switch (p) {
                 .text => |t| ContentPart{ .text = try redactor.redact(arena, t) },
                 .image_url => |img| ContentPart{ .image_url = .{
-                    .url = try redactor.redact(arena, img.url),
+                    .url = try redactor.redact(arena, stripUrlQueryFragment(img.url)),
                     .detail = img.detail,
                 } },
                 .image_base64 => p,
@@ -3580,65 +3607,10 @@ pub const Agent = struct {
         return out;
     }
 
-    /// Maximum recursion depth for `unredactJsonValue`. `std.json.parseFromSlice`
-    /// already caps nesting (default 256), so this is a defense-in-depth knob
-    /// — set comfortably below the platform call-stack limit so a hostile
-    /// provider response can't blow the stack.
-    const UNREDACT_JSON_MAX_DEPTH: u16 = 64;
-
-    /// Recursively walk a parsed JSON value and rehydrate every `[KIND_N]`
-    /// placeholder inside string **values** via `redactor.unredact`. Mutates
-    /// value in place; new strings are allocated on `allocator` (caller
-    /// passes a per-turn arena so cleanup is automatic). Object/array nodes
-    /// recurse; numbers/bools/nulls are passed through.
-    ///
-    /// Used to restore real PII into tool arguments before invoking the tool —
-    /// without this, an LLM that writes
-    /// `<tool_call>{"to":"[EMAIL_1]"}</tool_call>` would deliver the literal
-    /// placeholder to the tool implementation.
-    ///
-    /// **Object keys are NOT rehydrated.** Tool schemas use stable, predefined
-    /// JSON keys; an LLM emitting a `[KIND_N]` as a key would already be a
-    /// schema violation and the tool would mishandle it regardless. Walking
-    /// keys would also require re-allocating the ObjectMap because the parse
-    /// arena owns the existing key slices.
-    ///
-    /// Returns `error.JsonTooDeeplyNested` if recursion exceeds
-    /// `UNREDACT_JSON_MAX_DEPTH` so a malformed/hostile JSON tree can't
-    /// crash the agent via stack overflow.
-    fn unredactJsonValue(
-        allocator: std.mem.Allocator,
-        redactor: *redaction.Redactor,
-        value: *std.json.Value,
-    ) !void {
-        return unredactJsonValueDepth(allocator, redactor, value, 0);
-    }
-
-    fn unredactJsonValueDepth(
-        allocator: std.mem.Allocator,
-        redactor: *redaction.Redactor,
-        value: *std.json.Value,
-        depth: u16,
-    ) !void {
-        if (depth >= UNREDACT_JSON_MAX_DEPTH) return error.JsonTooDeeplyNested;
-        switch (value.*) {
-            .string => |s| {
-                const new_s = try redactor.unredact(allocator, s);
-                value.* = .{ .string = new_s };
-            },
-            .object => |*obj| {
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    try unredactJsonValueDepth(allocator, redactor, entry.value_ptr, depth + 1);
-                }
-            },
-            .array => |*arr| {
-                for (arr.items) |*v| {
-                    try unredactJsonValueDepth(allocator, redactor, v, depth + 1);
-                }
-            },
-            else => {}, // number_string, integer, float, bool, null
-        }
+    fn stripUrlQueryFragment(url: []const u8) []const u8 {
+        const query_pos = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+        const fragment_pos = std.mem.indexOfScalar(u8, url, '#') orelse url.len;
+        return url[0..@min(query_pos, fragment_pos)];
     }
 
     fn appendMultimodalAllowedDir(
@@ -11083,8 +11055,9 @@ test "Agent: clearHistory resets redactor placeholder state" {
     try std.testing.expect(std.mem.indexOf(u8, state.captured_user.?, "[EMAIL_2]") == null);
 }
 
-test "Agent.redactMessagesForProvider redacts multimodal text and image URLs" {
-    // Direct unit test on the helper: text content_parts and image URLs get redacted.
+test "Agent.redactMessagesForProvider redacts multimodal text and strips image URL queries" {
+    // Direct unit test on the helper: text content_parts and image URLs get
+    // scrubbed before provider handoff. Query/fragment credentials are stripped.
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -11094,7 +11067,7 @@ test "Agent.redactMessagesForProvider redacts multimodal text and image URLs" {
 
     const parts = [_]ContentPart{
         ContentPart{ .text = "see a@b.co for context" },
-        ContentPart{ .image_url = .{ .url = "https://example.com/x.png?token=abc123&email=user@example.com" } },
+        ContentPart{ .image_url = .{ .url = "https://example.com/user@example.com/x.png?token=abc123&X-Amz-Signature=deadbeef#frag" } },
     };
     const messages = [_]ChatMessage{
         ChatMessage{
@@ -11116,79 +11089,20 @@ test "Agent.redactMessagesForProvider redacts multimodal text and image URLs" {
     try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "a@b.co") == null);
 
-    // Image URL query/path content is redacted before provider handoff.
+    // Image URL query/fragment content is dropped and path content is redacted
+    // before provider handoff.
     try std.testing.expect(std.meta.activeTag(out_parts[1]) == .image_url);
     try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "abc123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "deadbeef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "?") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "#") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "user@example.com") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "[TOKEN_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "[EMAIL_2]") != null);
 }
 
-// ---- placeholder rehydration before tool.execute() ----
-
-test "Agent.unredactJsonValue rehydrates strings, recurses into objects/arrays" {
-    const allocator = std.testing.allocator;
-
-    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
-    defer redactor.deinit();
-
-    // Seed redactor: redacting populates the reverse map.
-    const seeded = try redactor.redact(allocator, "to alice@acme.com cc bob@acme.com");
-    defer allocator.free(seeded);
-    // Sanity: alice→[EMAIL_1], bob→[EMAIL_2] in deterministic order.
-    try std.testing.expect(std.mem.indexOf(u8, seeded, "[EMAIL_1]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seeded, "[EMAIL_2]") != null);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const tool_alloc = arena.allocator();
-
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        tool_alloc,
-        \\{"to":"[EMAIL_1]","cc":["[EMAIL_2]"],"meta":{"reply_to":"[EMAIL_1]"},"max_rows":50,"flag":true,"note":null}
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-
-    try Agent.unredactJsonValue(tool_alloc, &redactor, &parsed.value);
-
-    const obj = parsed.value.object;
-    try std.testing.expectEqualStrings("alice@acme.com", obj.get("to").?.string);
-    const cc = obj.get("cc").?.array;
-    try std.testing.expectEqualStrings("bob@acme.com", cc.items[0].string);
-    try std.testing.expectEqualStrings("alice@acme.com", obj.get("meta").?.object.get("reply_to").?.string);
-    // Non-string values pass through unchanged.
-    try std.testing.expectEqual(@as(i64, 50), obj.get("max_rows").?.integer);
-    try std.testing.expectEqual(true, obj.get("flag").?.bool);
-    try std.testing.expectEqual(std.json.Value{ .null = {} }, obj.get("note").?);
-}
-
-test "Agent.unredactJsonValue passes unknown placeholder verbatim" {
-    const allocator = std.testing.allocator;
-
-    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
-    defer redactor.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        arena.allocator(),
-        "{\"to\":\"[EMAIL_99]\"}",
-        .{},
-    );
-    defer parsed.deinit();
-
-    try Agent.unredactJsonValue(arena.allocator(), &redactor, &parsed.value);
-    try std.testing.expectEqualStrings("[EMAIL_99]", parsed.value.object.get("to").?.string);
-}
-
-test "Agent.executeTool rehydrates redactor placeholders in tool args" {
-    // Integration: agent has redactor on, LLM "passed back" [EMAIL_1] in args.
-    // executeTool must rehydrate before the tool sees them.
+test "Agent.executeTool does not rehydrate redactor placeholders in tool args" {
+    // Regression: provider-bound redaction must not become a provider->tool
+    // exfiltration channel. Tools receive literal placeholders by default.
     const RecordTool = struct {
         const Self = @This();
         last_seen: ?[]u8 = null,
@@ -11221,7 +11135,7 @@ test "Agent.executeTool rehydrates redactor placeholders in tool args" {
     var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
     defer redactor.deinit();
 
-    // Populate reverse map: alice→[EMAIL_1].
+    // Populate reverse map: alice -> [EMAIL_1].
     const seeded = try redactor.redact(allocator, "ping alice@acme.com");
     defer allocator.free(seeded);
 
@@ -11253,8 +11167,6 @@ test "Agent.executeTool rehydrates redactor placeholders in tool args" {
         .arguments_json = "{\"text\":\"please notify [EMAIL_1] about the issue\"}",
         .tool_call_id = null,
     };
-    // Production passes a per-turn arena as `tool_allocator`; mirror that
-    // here so unredact()'s allocations don't outlive the call.
     var tool_arena = std.heap.ArenaAllocator.init(allocator);
     defer tool_arena.deinit();
     const result = agent.executeTool(tool_arena.allocator(), call);
@@ -11262,77 +11174,16 @@ test "Agent.executeTool rehydrates redactor placeholders in tool args" {
     try std.testing.expect(result.success);
     try std.testing.expect(record_impl.last_seen != null);
     try std.testing.expectEqualStrings(
-        "please notify alice@acme.com about the issue",
+        "please notify [EMAIL_1] about the issue",
         record_impl.last_seen.?,
     );
-}
-
-test "Agent.unredactJsonValue rehydrates strings inside nested arrays" {
-    // Coverage gap from review: helper recursion through arrays-of-objects.
-    const allocator = std.testing.allocator;
-
-    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
-    defer redactor.deinit();
-
-    const seeded = try redactor.redact(allocator, "alice@acme.com bob@acme.com carol@acme.com");
-    defer allocator.free(seeded);
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        arena.allocator(),
-        \\{"recipients":[{"to":"[EMAIL_1]"},{"to":"[EMAIL_2]"},{"to":"[EMAIL_3]"}]}
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-
-    try Agent.unredactJsonValue(arena.allocator(), &redactor, &parsed.value);
-
-    const recipients = parsed.value.object.get("recipients").?.array;
-    try std.testing.expectEqual(@as(usize, 3), recipients.items.len);
-    try std.testing.expectEqualStrings("alice@acme.com", recipients.items[0].object.get("to").?.string);
-    try std.testing.expectEqualStrings("bob@acme.com", recipients.items[1].object.get("to").?.string);
-    try std.testing.expectEqualStrings("carol@acme.com", recipients.items[2].object.get("to").?.string);
-}
-
-test "Agent.unredactJsonValue caps recursion depth on hostile input" {
-    // Defense-in-depth: parseFromSlice already bounds nesting (default ~256),
-    // but the walker enforces its own cap so a future loosening of parser
-    // options can't blow the agent's stack.
-    const allocator = std.testing.allocator;
-    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
-    defer redactor.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    // Build nested array deeper than UNREDACT_JSON_MAX_DEPTH (64).
-    const depth: usize = 80;
-    var sb: std.ArrayListUnmanaged(u8) = .empty;
-    defer sb.deinit(arena_alloc);
-    var i: usize = 0;
-    while (i < depth) : (i += 1) try sb.append(arena_alloc, '[');
-    try sb.appendSlice(arena_alloc, "\"x\"");
-    i = 0;
-    while (i < depth) : (i += 1) try sb.append(arena_alloc, ']');
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena_alloc, sb.items, .{
-        .max_value_len = 4096,
-    });
-    defer parsed.deinit();
-
-    const result = Agent.unredactJsonValue(arena_alloc, &redactor, &parsed.value);
-    try std.testing.expectError(error.JsonTooDeeplyNested, result);
 }
 
 test "Agent: redactor placeholder from image_url rehydrates in CLI display path" {
     // Regression: redactMessagesForProvider feeds image_url.url through the
     // same Redactor as text content, so any token captured from a URL must
-    // round-trip via the same reverse map. Emulate the "image URL captured →
-    // LLM echoed placeholder → display unredact" round-trip directly through
+    // round-trip via the same reverse map. Emulate the "image URL captured ->
+    // LLM echoed placeholder -> display unredact" round-trip directly through
     // the Redactor (the CLI print path is just `redactor.unredact(response)`).
     const allocator = std.testing.allocator;
     var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
@@ -11342,7 +11193,7 @@ test "Agent: redactor placeholder from image_url rehydrates in CLI display path"
     defer arena.deinit();
 
     const parts = [_]ContentPart{
-        ContentPart{ .image_url = .{ .url = "https://example.com/p.png?email=user@example.com" } },
+        ContentPart{ .image_url = .{ .url = "https://example.com/user@example.com/p.png?sig=raw-secret" } },
     };
     const messages = [_]ChatMessage{
         ChatMessage{ .role = .user, .content = "", .content_parts = &parts },
