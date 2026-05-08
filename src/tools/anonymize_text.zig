@@ -9,8 +9,8 @@
 //! Cross-call coupling lives intentionally in the agent-wide pre-provider
 //! redactor, not here.
 //!
-//! The tool never returns the original sensitive substrings on the success
-//! path — only deterministic placeholders.
+//! For enabled categories, matched values are replaced with deterministic
+//! placeholders.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -29,7 +29,7 @@ pub const AnonymizeTextTool = struct {
     pub const tool_description =
         "Replace personally-identifiable or sensitive substrings in `text` " ++
         "with deterministic placeholders like [EMAIL_1], [PHONE_1], [CARD_1], " ++
-        "[ID_1], [TOKEN_1]. Detects emails, E.164 phone numbers, " ++
+        "[ID_1], [TOKEN_1]. Detects emails, common phone numbers, " ++
         "Luhn-validated card numbers, anchored passport/id values, and " ++
         "common API token / secret patterns. Each call is independent — " ++
         "placeholder counters restart from 1. Use to scrub user-supplied " ++
@@ -37,7 +37,7 @@ pub const AnonymizeTextTool = struct {
         "the redacted text as a plain string. Categories can be disabled " ++
         "individually via `redact_*` flags (default: all true).";
     pub const tool_params =
-        \\{"type":"object","properties":{"text":{"type":"string","description":"Free-form text to anonymize. Maximum 262144 bytes."},"redact_email":{"type":"boolean","description":"Redact email addresses. Default: true."},"redact_phone":{"type":"boolean","description":"Redact E.164 phone numbers (must start with +). Default: true."},"redact_card":{"type":"boolean","description":"Redact Luhn-valid card numbers. Default: true."},"redact_id":{"type":"boolean","description":"Redact anchored passport/id values (e.g. `passport: 12345678`). Default: true."},"redact_tokens":{"type":"boolean","description":"Redact API tokens and secrets (Bearer, sk-, ghp_, api_key=, etc.). Default: true."}},"required":["text"]}
+        \\{"type":"object","properties":{"text":{"type":"string","description":"Free-form text to anonymize. Maximum 262144 bytes."},"redact_email":{"type":"boolean","description":"Redact email addresses. Default: true."},"redact_phone":{"type":"boolean","description":"Redact common phone numbers. Default: true."},"redact_card":{"type":"boolean","description":"Redact Luhn-valid card numbers. Default: true."},"redact_id":{"type":"boolean","description":"Redact anchored passport/id values (e.g. `passport: 12345678`). Default: true."},"redact_tokens":{"type":"boolean","description":"Redact API tokens and secrets (Bearer, sk-, ghp_, api_key=, etc.). Default: true."}},"required":["text"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -117,7 +117,7 @@ test "anonymize_text: redacts email" {
     try std.testing.expectEqualStrings("contact me at [EMAIL_1]", result.output);
 }
 
-test "anonymize_text: redacts phone in E.164" {
+test "anonymize_text: redacts plus-prefixed phone" {
     var at = AnonymizeTextTool{};
     const t = at.tool();
     const parsed = try root.parseTestArgs("{\"text\":\"call +12025551234 now\"}");

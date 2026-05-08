@@ -42,11 +42,12 @@ deterministic placeholders such as `[EMAIL_1]`, `[PHONE_1]`, or `[CARD_1]`
 before provider calls, local session persistence, memory autosave, diagnostics,
 and vector embedding sync.
 
-This is intentionally one-way. NullClaw does not keep a plaintext mapping for
-later `unredact`, so tools that require the original sensitive value may need
-the user to provide it again through an explicit workflow. For example, if a
-model asks a tool to send mail to `[EMAIL_1]`, the tool should treat that as a
-placeholder rather than a real address.
+The reusable redactor defaults to one-way operation: it keys values by
+HMAC-SHA256 fingerprints and does not retain the original plaintext. The agent
+uses an opt-in in-memory reverse map for its per-conversation redactor so it can
+rehydrate placeholders before tool execution and console display. That reverse
+map lives only in process RAM, is reset with the conversation, and is not written
+to memory, history, JSONL export, or diagnostics.
 
 The redactor is a lightweight text scanner, not a full DLP/OCR engine. It covers
 common text forms for emails, phone numbers, Luhn-valid cards, anchored
@@ -64,6 +65,21 @@ notebook, model-evaluation job, or reviewer outside the local trust boundary.
 Use `nullclaw memory hygiene-report` before cleanup work. The command is always
 a dry run: it reports exact and normalized duplicate groups without deleting,
 rewriting, or reindexing memory entries.
+
+## On-Demand Anonymization Tool
+
+The `anonymize_text` tool exposes the same lightweight redaction primitive to
+the agent for one-off text snippets. It accepts a required `text` field and
+optional `redact_email`, `redact_phone`, `redact_card`, `redact_id`, and
+`redact_tokens` booleans. All categories are enabled by default; explicitly
+disabled categories pass through unchanged.
+
+Each call uses a fresh one-way redactor, so placeholder counters restart from
+`[EMAIL_1]` / `[PHONE_1]` inside that call and no plaintext reverse map is kept
+after the tool returns. Use it before putting user-supplied text into tickets,
+notebooks, logs, exports, or downstream tools that do not need the original
+sensitive values. The tool is text-only and bounded to 256 KiB input; it does
+not inspect binary image contents, OCR text, or EXIF metadata.
 
 ## Channel Allowlists
 
