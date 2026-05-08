@@ -54,6 +54,17 @@ passport/ID values, and token/secret patterns. Binary image contents, OCR text,
 EXIF metadata, and unsupported locale-specific document formats are outside
 this boundary unless another tool extracts them as text first.
 
+## Governed Memory Workflows
+
+Use `nullclaw memory export-jsonl` when memory needs to become a DS artifact.
+The command emits JSONL with a stable schema and excludes bootstrap/autosave
+internal entries by default. Add `--redact-pii` before sending the export to a
+notebook, model-evaluation job, or reviewer outside the local trust boundary.
+
+Use `nullclaw memory hygiene-report` before cleanup work. The command is always
+a dry run: it reports exact and normalized duplicate groups without deleting,
+rewriting, or reindexing memory entries.
+
 ## Channel Allowlists
 
 - `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.

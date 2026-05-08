@@ -148,8 +148,20 @@ Notes:
 | `nullclaw memory search "query" --limit 10` | Run retrieval against memory |
 | `nullclaw memory get <key>` | Show one memory entry |
 | `nullclaw memory list --category task --limit 20` | List memory entries by category |
+| `nullclaw memory export-jsonl --redact-pii --limit 1000` | Export a governed JSONL dataset from memory |
+| `nullclaw memory hygiene-report --json` | Dry-run exact/normalized duplicate report for memory |
 | `nullclaw memory drain-outbox` | Drain the durable vector outbox queue |
 | `nullclaw memory forget <key>` | Delete one memory entry |
+
+`memory export-jsonl` emits one JSON object per line with a stable
+`schema_version`, `key`, `category`, `timestamp`, `session_id`, and `content`
+schema. Bootstrap/autosave internals are excluded unless `--include-internal`
+is passed. Use `--redact-pii` when preparing memory data for DS notebooks,
+model evaluation, or external review.
+
+`memory hygiene-report` is non-destructive. It scans the selected memory slice
+and reports exact duplicates plus normalized duplicates where case and
+whitespace differ. It does not delete or rewrite entries.
 
 ### `workspace`, `capabilities`, `models`, `migrate`
 
