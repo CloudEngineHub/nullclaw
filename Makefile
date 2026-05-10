@@ -16,7 +16,7 @@ export NULLCLAW_DOCKER_TARGET := $(DOCKER_TARGET)
 export NULLCLAW_VERSION := $(VERSION)
 export NULLCLAW_PORT
 
-.PHONY: build config up down run shell logs check-buildx
+.PHONY: build config up down run agent status shell logs check-buildx
 
 check-buildx:
 	$(BUILDX) version >/dev/null
@@ -35,6 +35,12 @@ down:
 
 run:
 	$(COMPOSE) --profile agent run --rm agent $(RUN_ARGS)
+
+agent:
+	$(COMPOSE) --profile agent run --rm agent agent
+
+status:
+	$(COMPOSE) --profile agent run --rm agent status
 
 shell:
 	$(COMPOSE) --profile agent run --rm --entrypoint /bin/sh agent
