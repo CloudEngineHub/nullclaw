@@ -36,6 +36,7 @@
       "accounts": {
         "main": {
           "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false
         }

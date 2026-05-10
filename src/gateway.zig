@@ -493,6 +493,7 @@ pub const GatewayState = struct {
     whatsapp_account_id: []const u8 = "default",
     telegram_bot_token: []const u8,
     telegram_account_id: []const u8 = "default",
+    telegram_webhook_secret: ?[]const u8 = null,
     telegram_allow_from: []const []const u8 = &.{},
     whatsapp_allow_from: []const []const u8 = &.{},
     whatsapp_group_allow_from: []const []const u8 = &.{},
@@ -1905,7 +1906,7 @@ fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
 }
 
 fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []const u8, body: []const u8) bool {
-    if (allow_from.len == 0) return true;
+    if (allow_from.len == 0) return false;
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
@@ -1931,6 +1932,14 @@ fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []con
     }
 
     return false;
+}
+
+fn telegramWebhookSecretMatches(raw_request: []const u8, configured_secret: ?[]const u8) bool {
+    const secret = configured_secret orelse return false;
+    if (secret.len == 0) return false;
+    const header = extractHeader(raw_request, "X-Telegram-Bot-Api-Secret-Token") orelse return false;
+    const trimmed = std.mem.trim(u8, header, " \t\r\n");
+    return constantTimeEq(trimmed, secret);
 }
 
 fn telegramSessionKeyRouted(
@@ -3148,10 +3157,18 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         var tg_bot_token = ctx.state.telegram_bot_token;
         var tg_allow_from = ctx.state.telegram_allow_from;
         var tg_account_id = ctx.state.telegram_account_id;
+        var tg_webhook_secret = ctx.state.telegram_webhook_secret;
         if (selectTelegramConfig(ctx.config_opt, ctx.target)) |tg_cfg| {
             tg_bot_token = tg_cfg.bot_token;
             tg_allow_from = tg_cfg.allow_from;
             tg_account_id = tg_cfg.account_id;
+            tg_webhook_secret = tg_cfg.webhook_secret;
+        }
+
+        if (!telegramWebhookSecretMatches(ctx.raw_request, tg_webhook_secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
         }
 
         const msg_text = jsonStringField(b, "text");
@@ -7684,12 +7701,32 @@ test "whatsappSessionKey builds group key when group id exists" {
     try std.testing.expectEqualStrings("whatsapp:group:1203630@g.us:15550001111", key);
 }
 
-test "telegramSenderAllowed permits when allow_from is empty" {
+test "telegramSenderAllowed denies when allow_from is empty" {
     const allocator = std.testing.allocator;
     const body =
         \\{"message":{"from":{"id":12345,"username":"alice"}}}
     ;
-    try std.testing.expect(telegramSenderAllowed(allocator, &.{}, body));
+    try std.testing.expect(!telegramSenderAllowed(allocator, &.{}, body));
+}
+
+test "telegramSenderAllowed wildcard explicitly permits all senders" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"from":{"id":12345,"username":"alice"}}}
+    ;
+    const allow_from = [_][]const u8{"*"};
+    try std.testing.expect(telegramSenderAllowed(allocator, &allow_from, body));
+}
+
+test "telegramWebhookSecretMatches requires configured secret header" {
+    const raw =
+        "POST /telegram HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "X-Telegram-Bot-Api-Secret-Token: test-secret\r\n" ++
+        "\r\n{}";
+    try std.testing.expect(telegramWebhookSecretMatches(raw, "test-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, "wrong-secret"));
+    try std.testing.expect(!telegramWebhookSecretMatches(raw, null));
 }
 
 test "telegramChatId extracts nested message.chat.id" {

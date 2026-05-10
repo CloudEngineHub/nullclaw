@@ -1195,10 +1195,8 @@ pub const DiscordChannel = struct {
         }
 
         // Filter 3: allow_from allowlist
-        if (self.allow_from.len > 0) {
-            if (!root.isAllowedScoped("discord channel", self.allow_from, author_id)) {
-                return;
-            }
+        if (!root.isAllowedScoped("discord channel", self.allow_from, author_id)) {
+            return;
         }
 
         // Process attachments (if any)
@@ -1393,7 +1391,7 @@ pub const DiscordChannel = struct {
             else => null,
         } else null;
 
-        if (self.allow_from.len > 0 and !root.isAllowedScoped("discord channel", self.allow_from, user_id)) {
+        if (!root.isAllowedScoped("discord channel", self.allow_from, user_id)) {
             self.answerInteraction(interaction_id, interaction_token, "You are not allowed to use this button");
             return;
         }
@@ -1705,6 +1703,7 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     var ch = DiscordChannel.initFromConfig(alloc, .{
         .account_id = "dc-main",
         .token = "token",
+        .allow_from = &.{"u-1"},
     });
     ch.setBus(&event_bus);
 
@@ -1740,6 +1739,51 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expectEqualStrings("Discord User", meta.value.object.get("sender_display_name").?.string);
 }
 
+test "discord handleMessageCreate empty allow_from denies inbound message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate wildcard allow_from permits inbound message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_from = &.{"*"},
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), event_bus.inboundDepth());
+    var msg = event_bus.consumeInbound().?;
+    defer msg.deinit(alloc);
+}
+
 test "discord handleInteractionCreate publishes synthetic inbound command" {
     const alloc = std.testing.allocator;
     var event_bus = bus_mod.Bus.init();
@@ -1748,6 +1792,7 @@ test "discord handleInteractionCreate publishes synthetic inbound command" {
     var ch = DiscordChannel.initFromConfig(alloc, .{
         .account_id = "dc-main",
         .token = "token",
+        .allow_from = &.{"u-9"},
     });
     ch.setBus(&event_bus);
     defer ch.deinitPendingInteractions();
@@ -1787,6 +1832,7 @@ test "discord handleMessageCreate sets is_dm metadata for direct messages" {
     var ch = DiscordChannel.initFromConfig(alloc, .{
         .account_id = "dc-main",
         .token = "token",
+        .allow_from = &.{"u-7"},
     });
     ch.setBus(&event_bus);
 
@@ -1820,6 +1866,7 @@ test "discord handleMessageCreate require_mention blocks unmentioned guild messa
         .account_id = "dc-main",
         .token = "token",
         .require_mention = true,
+        .allow_from = &.{"u-2"},
     });
     ch.setBus(&event_bus);
     ch.bot_user_id = try alloc.dupe(u8, "bot-1");
@@ -1844,6 +1891,7 @@ test "discord handleMessageCreate require_mention accepts reply to bot message" 
         .account_id = "dc-main",
         .token = "token",
         .require_mention = true,
+        .allow_from = &.{"u-2"},
     });
     ch.setBus(&event_bus);
     ch.bot_user_id = try alloc.dupe(u8, "bot-1");
