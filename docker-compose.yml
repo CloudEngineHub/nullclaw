@@ -25,9 +25,9 @@ services:
     image: ${NULLCLAW_IMAGE:-nullclaw:local}
     build: *nullclaw-build
     profiles: ["gateway"]
-    command: ["gateway", "--port", "3000", "--host", "::"]
+    command: ["gateway", "--port", "${NULLCLAW_PORT:-3210}", "--host", "::"]
     ports:
-      - "127.0.0.1:${NULLCLAW_GATEWAY_PORT:-3000}:3000"
+      - "127.0.0.1:${NULLCLAW_PORT:-3210}:${NULLCLAW_PORT:-3210}"
     env_file:
       - path: .env
         required: false
@@ -35,7 +35,7 @@ services:
       - nullclaw-data:/nullclaw-data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:${NULLCLAW_PORT:-3210}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
