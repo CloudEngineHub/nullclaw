@@ -465,18 +465,7 @@ fn subagentProviderHolder(
     api_key: ?[]const u8,
     configured_provider: ?config_types.ProviderEntry,
 ) providers.ProviderHolder {
-    return providers.ProviderHolder.fromConfigWithApiMode(
-        allocator,
-        provider_name,
-        api_key,
-        if (configured_provider) |entry| entry.base_url else null,
-        if (configured_provider) |entry| entry.native_tools else true,
-        if (configured_provider) |entry| entry.user_agent else null,
-        if (configured_provider) |entry| entry.api_mode else .chat_completions,
-        if (configured_provider) |entry| entry.max_streaming_prompt_bytes else null,
-        if (configured_provider) |entry| entry.chat_template_enable_thinking_param else false,
-        if (configured_provider) |entry| entry.extra_body_params else null,
-    );
+    return providers.holderFromEntry(allocator, provider_name, api_key, configured_provider);
 }
 
 // ── Thread function ─────────────────────────────────────────────

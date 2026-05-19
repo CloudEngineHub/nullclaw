@@ -6,8 +6,8 @@ const admin_output = @import("admin_output.zig");
 const scrub = @import("providers/scrub.zig");
 const util = @import("util.zig");
 const process_util = @import("tools/process_util.zig");
-const audit = @import("audit/root.zig");
-const providers = @import("providers/root.zig");
+const audit_types = @import("audit/types.zig");
+const audit_envelope = @import("audit/envelope.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -54,103 +54,14 @@ const token_prefixes = [_][]const u8{
     "AKIA",
 };
 
-pub const Severity = enum {
-    medium,
-    high,
-    critical,
-
-    pub fn toString(self: Severity) []const u8 {
-        return switch (self) {
-            .medium => "medium",
-            .high => "high",
-            .critical => "critical",
-        };
-    }
-
-    fn rank(self: Severity) u8 {
-        return switch (self) {
-            .medium => 1,
-            .high => 2,
-            .critical => 3,
-        };
-    }
-};
-
-pub const Confidence = enum {
-    low,
-    medium,
-    high,
-
-    pub fn toString(self: Confidence) []const u8 {
-        return switch (self) {
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
-        };
-    }
-};
-
-pub const FailureThreshold = enum {
-    none,
-    medium,
-    high,
-    critical,
-
-    pub fn toString(self: FailureThreshold) []const u8 {
-        return switch (self) {
-            .none => "none",
-            .medium => "medium",
-            .high => "high",
-            .critical => "critical",
-        };
-    }
-
-    pub fn parse(raw: []const u8) ?FailureThreshold {
-        const map = std.StaticStringMap(FailureThreshold).initComptime(.{
-            .{ "none", .none },
-            .{ "medium", .medium },
-            .{ "high", .high },
-            .{ "critical", .critical },
-        });
-        return map.get(raw);
-    }
-
-    fn rank(self: FailureThreshold) u8 {
-        return switch (self) {
-            .none => 0,
-            .medium => 1,
-            .high => 2,
-            .critical => 3,
-        };
-    }
-};
-
-pub const FindingSource = enum {
-    workspace_file,
-    git_staged_diff,
-    git_history,
-
-    pub fn toString(self: FindingSource) []const u8 {
-        return switch (self) {
-            .workspace_file => "workspace_file",
-            .git_staged_diff => "git_staged_diff",
-            .git_history => "git_history",
-        };
-    }
-};
-
-pub const TriageMode = enum {
-    off,
-    dry_run,
-    external,
-
-    pub fn parse(text: []const u8) ?TriageMode {
-        if (std.mem.eql(u8, text, "off")) return .off;
-        if (std.mem.eql(u8, text, "dry-run") or std.mem.eql(u8, text, "dry_run")) return .dry_run;
-        if (std.mem.eql(u8, text, "external") or std.mem.eql(u8, text, "on")) return .external;
-        return null;
-    }
-};
+pub const Severity = audit_types.Severity;
+pub const Confidence = audit_types.Confidence;
+pub const FailureThreshold = audit_types.FailureThreshold;
+pub const FindingSource = audit_types.FindingSource;
+pub const TriageMode = audit_types.TriageMode;
+pub const Finding = audit_types.Finding;
+pub const Report = audit_types.Report;
+pub const TriageStats = audit_types.TriageStats;
 
 pub const Options = struct {
     workspace_dir: []const u8,
@@ -161,61 +72,7 @@ pub const Options = struct {
     fail_on: FailureThreshold = .high,
     only_secrets: bool = false,
     exclude_patterns: []const []const u8 = &.{},
-    triage_mode: TriageMode = .off,
-    triage_provider: ?[]const u8 = null,
-    triage_model: ?[]const u8 = null,
-    triage_provider_client: ?providers.Provider = null,
-    triage_temperature: f64 = 0.0,
-    audit_log_path: ?[]const u8 = null,
-};
-
-pub const Finding = struct {
-    severity: Severity,
-    confidence: Confidence,
-    rule: []u8,
-    path: []u8,
-    line: ?usize,
-    source: FindingSource,
-    preview: []u8,
-    // Internal fields for LLM triage envelope construction. Not serialized.
-    raw_line: ?[]u8 = null,
-    detected_value: ?[]u8 = null,
-    assignment_key: ?[]u8 = null,
-    assignment_operator: ?[]u8 = null,
-
-    pub fn deinit(self: *Finding, allocator: Allocator) void {
-        allocator.free(self.rule);
-        allocator.free(self.path);
-        allocator.free(self.preview);
-        if (self.raw_line) |v| allocator.free(v);
-        if (self.detected_value) |v| allocator.free(v);
-        if (self.assignment_key) |v| allocator.free(v);
-        if (self.assignment_operator) |v| allocator.free(v);
-    }
-};
-
-pub const Report = struct {
-    workspace_dir: []const u8,
-    repo_root: ?[]u8,
-    findings: []Finding,
-    medium_count: usize = 0,
-    high_count: usize = 0,
-    critical_count: usize = 0,
-    scanned_source: FindingSource,
-
-    pub fn deinit(self: *Report, allocator: Allocator) void {
-        for (self.findings) |*finding| finding.deinit(allocator);
-        allocator.free(self.findings);
-        if (self.repo_root) |root| allocator.free(root);
-    }
-
-    pub fn exceedsThreshold(self: Report, threshold: FailureThreshold) bool {
-        if (threshold == .none) return false;
-        for (self.findings) |finding| {
-            if (finding.severity.rank() >= threshold.rank()) return true;
-        }
-        return false;
-    }
+    collect_triage_context: bool = false,
 };
 
 pub const AuditError = error{
@@ -249,38 +106,12 @@ pub fn run(allocator: Allocator, options: Options) !u8 {
     var report = try buildReport(allocator, resolved_workspace, options);
     defer report.deinit(allocator);
 
-    var maybe_stats: ?audit.TriageStats = null;
-    if (options.triage_mode != .off) {
-        const home_env = std_compat.process.getEnvVarOwned(allocator, "HOME") catch null;
-        defer if (home_env) |h| allocator.free(h);
-        const home: []const u8 = home_env orelse ".";
-
-        var owned_log_path: ?[]u8 = null;
-        defer if (owned_log_path) |p| allocator.free(p);
-        const log_path: []const u8 = if (options.audit_log_path) |p| p else blk: {
-            const path = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/audit-log.jsonl", .{home});
-            owned_log_path = path;
-            break :blk path;
-        };
-
-        maybe_stats = try audit.triager.runTriage(allocator, &report, options, log_path);
-    }
-
-    const rendered = if (options.json)
-        try renderJson(allocator, report, options.fail_on)
-    else
-        try renderText(allocator, report, options.fail_on);
+    const rendered = try renderReport(allocator, report, options.fail_on, options.json, null);
     defer allocator.free(rendered);
 
     try admin_output.writeStdoutBytes(rendered);
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
         try admin_output.writeStdoutBytes("\n");
-    }
-
-    if (maybe_stats) |stats| {
-        const stats_line = try audit.triager.renderStatsText(allocator, stats);
-        defer allocator.free(stats_line);
-        try admin_output.writeStdoutBytes(stats_line);
     }
 
     return if (report.exceedsThreshold(options.fail_on)) 1 else 0;
@@ -785,7 +616,7 @@ fn appendFinding(
 ) !void {
     if (options.only_secrets and rule.severity.rank() < Severity.high.rank()) return;
 
-    const collect = options.triage_mode != .off;
+    const collect = options.collect_triage_context;
     const raw_line: ?[]u8 = if (collect) try allocator.dupe(u8, raw_preview) else null;
     errdefer if (raw_line) |v| allocator.free(v);
     const detected_value: ?[]u8 = if (collect and rule.detected_value != null) try allocator.dupe(u8, rule.detected_value.?) else null;
@@ -1164,7 +995,7 @@ fn containsHighEntropyCandidate(line: []const u8) bool {
                 !looksPlaceholder(candidate) and
                 !looksLikeUuid(candidate) and
                 !looksLikeGitCommitHash(candidate) and
-                audit.envelope.computeShannonEntropy(candidate) >= 4.0)
+                audit_envelope.computeShannonEntropy(candidate) >= 4.0)
             {
                 return true;
             }
@@ -1249,7 +1080,20 @@ fn appendFmt(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, comptime fm
     try buf.appendSlice(allocator, rendered);
 }
 
-fn renderText(allocator: Allocator, report: Report, fail_on: FailureThreshold) ![]u8 {
+pub fn renderReport(
+    allocator: Allocator,
+    report: Report,
+    fail_on: FailureThreshold,
+    json: bool,
+    triage_stats: ?TriageStats,
+) ![]u8 {
+    return if (json)
+        renderJson(allocator, report, fail_on, triage_stats)
+    else
+        renderText(allocator, report, fail_on, triage_stats);
+}
+
+fn renderText(allocator: Allocator, report: Report, fail_on: FailureThreshold, triage_stats: ?TriageStats) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
@@ -1281,10 +1125,13 @@ fn renderText(allocator: Allocator, report: Report, fail_on: FailureThreshold) !
         report.high_count,
         report.medium_count,
     });
+    if (triage_stats) |stats| {
+        try appendTriageStatsText(&buf, allocator, stats);
+    }
     return try buf.toOwnedSlice(allocator);
 }
 
-fn renderJson(allocator: Allocator, report: Report, fail_on: FailureThreshold) ![]u8 {
+fn renderJson(allocator: Allocator, report: Report, fail_on: FailureThreshold, triage_stats: ?TriageStats) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
@@ -1338,8 +1185,58 @@ fn renderJson(allocator: Allocator, report: Report, fail_on: FailureThreshold) !
         try json_util.appendJsonKeyValue(&buf, allocator, "preview", finding.preview);
         try buf.appendSlice(allocator, "}");
     }
-    try buf.appendSlice(allocator, "]}");
+    try buf.appendSlice(allocator, "]");
+    if (triage_stats) |stats| {
+        try buf.appendSlice(allocator, ",");
+        try appendTriageStatsJson(&buf, allocator, stats);
+    }
+    try buf.appendSlice(allocator, "}");
     return try buf.toOwnedSlice(allocator);
+}
+
+fn appendTriageStatsText(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, stats: TriageStats) !void {
+    try appendFmt(
+        buf,
+        allocator,
+        "Triage: {d} findings | {d} envelopes | {d} llm calls | verdicts: {d} real, {d} false_positive, {d} uncertain | dropped {d}, adjusted {d}, skipped_budget {d}, errors {d}\n",
+        .{
+            stats.findings_seen,
+            stats.envelopes_built,
+            stats.llm_calls,
+            stats.verdicts_real,
+            stats.verdicts_false,
+            stats.verdicts_uncertain,
+            stats.findings_dropped,
+            stats.findings_adjusted,
+            stats.skipped_budget,
+            stats.errors,
+        },
+    );
+}
+
+fn appendTriageStatsJson(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, stats: TriageStats) !void {
+    try json_util.appendJsonKey(buf, allocator, "triage");
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonInt(buf, allocator, "findings_seen", @intCast(stats.findings_seen));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "envelopes_built", @intCast(stats.envelopes_built));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "llm_calls", @intCast(stats.llm_calls));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "verdicts_real", @intCast(stats.verdicts_real));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "verdicts_false", @intCast(stats.verdicts_false));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "verdicts_uncertain", @intCast(stats.verdicts_uncertain));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "findings_dropped", @intCast(stats.findings_dropped));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "findings_adjusted", @intCast(stats.findings_adjusted));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "skipped_budget", @intCast(stats.skipped_budget));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "errors", @intCast(stats.errors));
+    try buf.appendSlice(allocator, "}");
 }
 
 test "detect private key block as critical" {
@@ -1643,6 +1540,31 @@ test "failure threshold none never fails" {
     try std.testing.expect(report.exceedsThreshold(.critical));
 }
 
+test "renderReport keeps triage stats inside json output" {
+    const findings = try std.testing.allocator.alloc(Finding, 0);
+    defer std.testing.allocator.free(findings);
+    const report = Report{
+        .workspace_dir = "/tmp/ws",
+        .repo_root = null,
+        .findings = findings,
+        .scanned_source = .workspace_file,
+    };
+    const rendered = try renderReport(std.testing.allocator, report, .high, true, .{
+        .findings_seen = 2,
+        .envelopes_built = 2,
+        .llm_calls = 1,
+        .skipped_budget = 1,
+    });
+    defer std.testing.allocator.free(rendered);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rendered, .{});
+    defer parsed.deinit();
+
+    const triage_obj = parsed.value.object.get("triage").?.object;
+    try std.testing.expectEqual(@as(i64, 1), triage_obj.get("llm_calls").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), triage_obj.get("skipped_budget").?.integer);
+}
+
 test "append finding cleans partial allocations on allocation failure" {
     const rule = DetectedRule{
         .severity = .high,
@@ -1652,7 +1574,7 @@ test "append finding cleans partial allocations on allocation failure" {
     };
     const options = Options{
         .workspace_dir = "/tmp/ws",
-        .triage_mode = .dry_run,
+        .collect_triage_context = true,
     };
 
     var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});

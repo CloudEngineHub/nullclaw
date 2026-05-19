@@ -5,31 +5,29 @@
 //! verdict (drop false positives, adjust severity).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 
 const envelope = @import("envelope.zig");
 const llm_client = @import("llm_client.zig");
 const audit_log_mod = @import("audit_log.zig");
-const workspace_audit = @import("../workspace_audit.zig");
+const types = @import("types.zig");
 
-const Finding = workspace_audit.Finding;
-const Severity = workspace_audit.Severity;
-const Confidence = workspace_audit.Confidence;
-const Report = workspace_audit.Report;
-const Options = workspace_audit.Options;
+const Finding = types.Finding;
+const Severity = types.Severity;
+const Confidence = types.Confidence;
+const Report = types.Report;
+pub const TriageMode = types.TriageMode;
+pub const TriageStats = types.TriageStats;
 const Verdict = llm_client.Verdict;
 const Decision = llm_client.Decision;
 
-pub const TriageStats = struct {
-    findings_seen: usize = 0,
-    envelopes_built: usize = 0,
-    llm_calls: usize = 0,
-    verdicts_real: usize = 0,
-    verdicts_false: usize = 0,
-    verdicts_uncertain: usize = 0,
-    findings_dropped: usize = 0,
-    findings_adjusted: usize = 0,
-    errors: usize = 0,
+pub const DEFAULT_MAX_LLM_CALLS: usize = 50;
+
+pub const Options = struct {
+    mode: TriageMode = .off,
+    client: ?llm_client.TriageClient = null,
+    max_llm_calls: usize = DEFAULT_MAX_LLM_CALLS,
 };
 
 /// Run triage on a report. Mutates `report.findings` (may drop entries).
@@ -73,41 +71,29 @@ pub fn runTriage(
         const env_json = try envelope.serializeJson(allocator, env);
         defer allocator.free(env_json);
 
-        if (options.triage_mode == .dry_run) {
+        if (options.mode == .dry_run) {
             try printDryRunEnvelope(env_json);
             try kept.append(allocator, finding.*);
             finding.* = makeEmptyFinding();
             continue;
         }
 
-        const provider_name = options.triage_provider orelse {
+        const client = options.client orelse {
             stats.errors += 1;
-            std.debug.print("triage: missing provider (configure agents.defaults.model.primary)\n", .{});
+            std.debug.print("triage: missing LLM triage client\n", .{});
             try kept.append(allocator, finding.*);
             finding.* = makeEmptyFinding();
             continue;
         };
-        const model_name = options.triage_model orelse {
-            stats.errors += 1;
-            std.debug.print("triage: missing model (configure agents.defaults.model.primary)\n", .{});
+
+        if (stats.llm_calls >= options.max_llm_calls) {
+            stats.skipped_budget += 1;
             try kept.append(allocator, finding.*);
             finding.* = makeEmptyFinding();
             continue;
-        };
-        const provider_client = options.triage_provider_client orelse {
-            stats.errors += 1;
-            std.debug.print("triage: missing provider client for '{s}'\n", .{provider_name});
-            try kept.append(allocator, finding.*);
-            finding.* = makeEmptyFinding();
-            continue;
-        };
-        var verdict = llm_client.triageEnvelope(
-            allocator,
-            provider_client,
-            model_name,
-            options.triage_temperature,
-            env_json,
-        ) catch |err| {
+        }
+
+        var verdict = client.triageEnvelope(allocator, env_json) catch |err| {
             stats.errors += 1;
             std.debug.print("triage: llm call failed for {s}:{?d}: {s}\n", .{
                 finding.path,
@@ -202,20 +188,72 @@ fn printDryRunEnvelope(env_json: []const u8) !void {
     std.debug.print("[dry-run-llm] {s}\n", .{env_json});
 }
 
-pub fn renderStatsText(allocator: Allocator, stats: TriageStats) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "Triage: {d} findings | {d} envelopes | {d} llm calls | verdicts: {d} real, {d} false_positive, {d} uncertain | dropped {d}, adjusted {d}, errors {d}\n",
-        .{
-            stats.findings_seen,
-            stats.envelopes_built,
-            stats.llm_calls,
-            stats.verdicts_real,
-            stats.verdicts_false,
-            stats.verdicts_uncertain,
-            stats.findings_dropped,
-            stats.findings_adjusted,
-            stats.errors,
-        },
-    );
+test "runTriage respects max llm calls" {
+    const allocator = std.testing.allocator;
+
+    const TestClient = struct {
+        calls: usize = 0,
+
+        fn triageEnvelope(ptr: *anyopaque, a: Allocator, _: []const u8) !Verdict {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .decision = .real_secret,
+                .severity_adjusted = try a.dupe(u8, "high"),
+                .reasoning = try a.dupe(u8, "real token shape"),
+                .confidence_score = 0.9,
+            };
+        }
+
+        const vtable = llm_client.TriageClient.VTable{
+            .triageEnvelope = triageEnvelope,
+        };
+    };
+
+    var findings = try allocator.alloc(Finding, 2);
+    findings[0] = try testFinding(allocator, ".env", "API_KEY=sk-live-1234567890abcdef");
+    findings[1] = try testFinding(allocator, "config.txt", "TOKEN=ghp_abcd1234567890secret");
+    var report = Report{
+        .workspace_dir = "/tmp/ws",
+        .repo_root = null,
+        .findings = findings,
+        .high_count = 2,
+        .scanned_source = .workspace_file,
+    };
+    defer report.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const log_path = try std.fs.path.join(allocator, &.{ tmp_path, "audit.jsonl" });
+    defer allocator.free(log_path);
+
+    var test_client = TestClient{};
+    const stats = try runTriage(allocator, &report, .{
+        .mode = .external,
+        .client = .{ .ptr = &test_client, .vtable = &TestClient.vtable },
+        .max_llm_calls = 1,
+    }, log_path);
+
+    try std.testing.expectEqual(@as(usize, 1), test_client.calls);
+    try std.testing.expectEqual(@as(usize, 1), stats.llm_calls);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_budget);
+    try std.testing.expectEqual(@as(usize, 2), report.findings.len);
+}
+
+fn testFinding(allocator: Allocator, path: []const u8, raw_line: []const u8) !Finding {
+    return .{
+        .severity = .high,
+        .confidence = .high,
+        .rule = try allocator.dupe(u8, "hardcoded_token"),
+        .path = try allocator.dupe(u8, path),
+        .line = 1,
+        .source = .workspace_file,
+        .preview = try allocator.dupe(u8, "preview"),
+        .raw_line = try allocator.dupe(u8, raw_line),
+        .detected_value = try allocator.dupe(u8, raw_line),
+        .assignment_key = null,
+        .assignment_operator = null,
+    };
 }

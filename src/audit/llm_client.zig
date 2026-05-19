@@ -7,6 +7,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const providers = @import("../providers/root.zig");
+const util = @import("../util.zig");
+
+const MAX_REASONING_BYTES: usize = 200;
 
 pub const Decision = enum {
     real_secret,
@@ -38,6 +41,41 @@ pub const Verdict = struct {
         allocator.free(self.severity_adjusted);
         allocator.free(self.reasoning);
     }
+};
+
+pub const TriageClient = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        triageEnvelope: *const fn (*anyopaque, Allocator, []const u8) anyerror!Verdict,
+    };
+
+    pub fn triageEnvelope(self: TriageClient, allocator: Allocator, envelope_json: []const u8) !Verdict {
+        return self.vtable.triageEnvelope(self.ptr, allocator, envelope_json);
+    }
+};
+
+pub const ProviderTriageClient = struct {
+    provider: providers.Provider,
+    model: []const u8,
+    temperature: f64,
+
+    pub fn client(self: *ProviderTriageClient) TriageClient {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn triageEnvelopeImpl(ptr: *anyopaque, allocator: Allocator, envelope_json: []const u8) !Verdict {
+        const self: *ProviderTriageClient = @ptrCast(@alignCast(ptr));
+        return triageEnvelope(allocator, self.provider, self.model, self.temperature, envelope_json);
+    }
+
+    const vtable = TriageClient.VTable{
+        .triageEnvelope = triageEnvelopeImpl,
+    };
 };
 
 const SYSTEM_PROMPT =
@@ -112,10 +150,11 @@ pub fn parseVerdictJson(allocator: Allocator, text: []const u8) !Verdict {
         "uncertain";
     const decision = Decision.parse(decision_str);
 
-    const severity_str = if (root.object.get("severity_adjusted")) |s|
+    const raw_severity_str = if (root.object.get("severity_adjusted")) |s|
         (if (s == .string) s.string else "medium")
     else
         "medium";
+    const severity_str = normalizeSeverity(raw_severity_str);
     const severity_dup = try allocator.dupe(u8, severity_str);
     errdefer allocator.free(severity_dup);
 
@@ -123,14 +162,16 @@ pub fn parseVerdictJson(allocator: Allocator, text: []const u8) !Verdict {
         (if (r == .string) r.string else "")
     else
         "";
-    const reasoning_dup = try allocator.dupe(u8, reasoning_str);
+    const reasoning_preview = util.previewUtf8(reasoning_str, MAX_REASONING_BYTES);
+    const reasoning_dup = try allocator.dupe(u8, reasoning_preview.slice);
     errdefer allocator.free(reasoning_dup);
 
-    const confidence: f64 = if (root.object.get("confidence_score")) |c| switch (c) {
+    const raw_confidence: f64 = if (root.object.get("confidence_score")) |c| switch (c) {
         .float => c.float,
         .integer => @floatFromInt(c.integer),
         else => 0.5,
     } else 0.5;
+    const confidence = normalizeConfidence(raw_confidence);
 
     return .{
         .decision = decision,
@@ -138,6 +179,21 @@ pub fn parseVerdictJson(allocator: Allocator, text: []const u8) !Verdict {
         .reasoning = reasoning_dup,
         .confidence_score = confidence,
     };
+}
+
+fn normalizeSeverity(text: []const u8) []const u8 {
+    if (std.mem.eql(u8, text, "critical")) return text;
+    if (std.mem.eql(u8, text, "high")) return text;
+    if (std.mem.eql(u8, text, "medium")) return text;
+    if (std.mem.eql(u8, text, "low")) return text;
+    return "medium";
+}
+
+fn normalizeConfidence(value: f64) f64 {
+    if (!std.math.isFinite(value)) return 0.5;
+    if (value < 0.0) return 0.0;
+    if (value > 1.0) return 1.0;
+    return value;
 }
 
 test "parseVerdictJson valid" {
@@ -160,6 +216,88 @@ test "parseVerdictJson false_positive" {
     var v = try parseVerdictJson(allocator, text);
     defer v.deinit(allocator);
     try std.testing.expectEqual(Decision.false_positive, v.decision);
+}
+
+test "parseVerdictJson normalizes model-controlled fields" {
+    const allocator = std.testing.allocator;
+    const long_reason = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"decision\":\"real_secret\",\"severity_adjusted\":\"bogus\",\"reasoning\":\"{s}\",\"confidence_score\":42.0}}",
+        .{long_reason},
+    );
+    defer allocator.free(text);
+
+    var v = try parseVerdictJson(allocator, text);
+    defer v.deinit(allocator);
+
+    try std.testing.expectEqual(Decision.real_secret, v.decision);
+    try std.testing.expectEqualStrings("medium", v.severity_adjusted);
+    try std.testing.expect(v.reasoning.len <= MAX_REASONING_BYTES);
+    try std.testing.expectEqual(@as(f64, 1.0), v.confidence_score);
+}
+
+test "provider triage client adapts provider vtable" {
+    const testing_allocator = std.testing.allocator;
+
+    const TestProvider = struct {
+        called: bool = false,
+
+        fn chatWithSystem(
+            ptr: *anyopaque,
+            allocator: Allocator,
+            _: ?[]const u8,
+            message: []const u8,
+            model: []const u8,
+            temperature: f64,
+        ) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called = true;
+            try std.testing.expectEqualStrings("{\"x\":1}", message);
+            try std.testing.expectEqualStrings("triage-model", model);
+            try std.testing.expectEqual(@as(f64, 0.0), temperature);
+            return allocator.dupe(u8, "{\"decision\":\"uncertain\",\"severity_adjusted\":\"medium\",\"reasoning\":\"ok\",\"confidence_score\":0.5}");
+        }
+
+        fn chat(_: *anyopaque, _: Allocator, _: providers.ChatRequest, _: []const u8, _: f64) !providers.ChatResponse {
+            return error.NotSupported;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        const vtable = providers.Provider.VTable{
+            .chatWithSystem = chatWithSystem,
+            .chat = chat,
+            .supportsNativeTools = supportsNativeTools,
+            .getName = getName,
+            .deinit = deinit,
+        };
+    };
+
+    var test_provider = TestProvider{};
+    const provider = providers.Provider{
+        .ptr = &test_provider,
+        .vtable = &TestProvider.vtable,
+    };
+    var provider_client = ProviderTriageClient{
+        .provider = provider,
+        .model = "triage-model",
+        .temperature = 0.0,
+    };
+
+    var verdict = try provider_client.client().triageEnvelope(testing_allocator, "{\"x\":1}");
+    defer verdict.deinit(testing_allocator);
+
+    try std.testing.expect(test_provider.called);
+    try std.testing.expectEqual(Decision.uncertain, verdict.decision);
 }
 
 test "stripFences removes markdown code fence" {

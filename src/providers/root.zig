@@ -24,6 +24,7 @@ pub const api_error_details = @import("api_error_details.zig");
 pub const scrub = @import("scrub.zig");
 pub const api_key = @import("api_key.zig");
 pub const factory = @import("factory.zig");
+pub const configured = @import("configured.zig");
 pub const helpers = @import("helpers.zig");
 
 // Re-exports from scrub.zig
@@ -46,6 +47,8 @@ pub const detectProviderByApiKey = factory.detectProviderByApiKey;
 pub const compatibleProviderUrl = factory.compatibleProviderUrl;
 pub const compatibleProviderDisplayName = factory.compatibleProviderDisplayName;
 pub const ProviderHolder = factory.ProviderHolder;
+pub const holderFromConfig = configured.holderFromConfig;
+pub const holderFromEntry = configured.holderFromEntry;
 
 // Re-exports from helpers.zig
 pub const isReasoningModel = helpers.isReasoningModel;
