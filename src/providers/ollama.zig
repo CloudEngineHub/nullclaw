@@ -443,8 +443,12 @@ pub const OllamaProvider = struct {
         );
     }
 
-    fn supportsStreamingImpl(_: *anyopaque) bool {
-        return true;
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+        // Streaming uses Ollama's OpenAI-compatible endpoint, while native tool
+        // calls use /api/chat. Prefer tool correctness by default; users can set
+        // provider native_tools=false to opt into live reasoning streaming.
+        return !self.native_tools;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -590,6 +594,16 @@ test "supportsNativeTools returns true" {
     var p = OllamaProvider.init(std.testing.allocator, null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "supportsStreaming is opt-in when native tools are disabled" {
+    var p = OllamaProvider.init(std.testing.allocator, null, null);
+    var prov = p.provider();
+    try std.testing.expect(!prov.supportsStreaming());
+
+    p.native_tools = false;
+    prov = p.provider();
+    try std.testing.expect(prov.supportsStreaming());
 }
 
 test "init stores api_key" {

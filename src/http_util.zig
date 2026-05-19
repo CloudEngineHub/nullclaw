@@ -182,6 +182,7 @@ pub const ProxyHttpClient = struct {
 
 pub const SafeResolveEntryError = Allocator.Error || error{
     InvalidUrl,
+    HostResolutionFailed,
     LocalAddressBlocked,
 };
 
@@ -220,13 +221,9 @@ fn buildCurlResolveEntry(
 /// Remote hosts are pinned to a concrete globally-routable address; explicit
 /// local/private hosts are left untouched so intentional local providers still work.
 ///
-/// If the Zig DNS resolver cannot reach the system resolver (common on macOS with
-/// mDNSResponder), `resolveConnectHost` returns `HostResolutionFailed`. In that case
-/// we skip the `--resolve` pin and let curl use its own resolver. This is safe because:
-///   1. `isLocalHost()` already blocks all known private/loopback/link-local ranges.
-///   2. A hostname that truly resolves to a local address triggers `LocalAddressBlocked`,
-///      which remains a hard error.
-///   3. A hostname that Zig cannot resolve but curl can is not an SSRF vector.
+/// DNS resolution failures are fail-closed. Falling back to curl's resolver would
+/// bypass the single resolved-address check and weaken SSRF protection against
+/// DNS answers that resolve to local/private networks.
 pub fn buildSafeResolveEntryForRemoteUrl(
     allocator: Allocator,
     url: []const u8,
@@ -237,21 +234,23 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (net_security.isLocalHost(host)) return null;
 
-    const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err| switch (err) {
-        // Zig stdlib DNS resolver failed (e.g. macOS mDNSResponder not supported).
-        // Let curl resolve the hostname with its own resolver instead of blocking the request.
-        error.HostResolutionFailed => {
-            log.debug("host resolution unavailable for {s}; skipping --resolve pin, deferring to curl", .{host});
-            return null;
-        },
-        // A resolved address was in a private/loopback range — hard block.
-        error.LocalAddressBlocked => return error.LocalAddressBlocked,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+    const connect_host = net_security.resolveConnectHost(allocator, host, port) catch |err|
+        return mapResolveConnectHostError(host, err);
     defer allocator.free(connect_host);
 
     if (!shouldUsePinnedResolve(host, connect_host)) return null;
     return try buildCurlResolveEntry(allocator, host, port, connect_host);
+}
+
+fn mapResolveConnectHostError(host: []const u8, err: net_security.ResolveConnectHostError) SafeResolveEntryError {
+    return switch (err) {
+        error.HostResolutionFailed => blk: {
+            log.debug("host resolution unavailable for {s}; failing closed", .{host});
+            break :blk error.HostResolutionFailed;
+        },
+        error.LocalAddressBlocked => error.LocalAddressBlocked,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 }
 
 pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
@@ -1315,6 +1314,12 @@ test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinni
 
 test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
     try std.testing.expectError(error.LocalAddressBlocked, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "https://2130706433/v1"));
+}
+
+test "buildSafeResolveEntryForRemoteUrl maps resolution failure to fail closed" {
+    // Regression: do not silently fall back to curl DNS on resolver failure,
+    // because that bypasses private-address screening before --resolve pinning.
+    try std.testing.expect(mapResolveConnectHostError("example.com", error.HostResolutionFailed) == error.HostResolutionFailed);
 }
 
 test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
