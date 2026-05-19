@@ -215,6 +215,48 @@ pub const SseLineResult = union(enum) {
     skip: void,
 };
 
+const THINK_OPEN_TAG = "<think>";
+const THINK_CLOSE_TAG = "</think>";
+
+fn closeReasoningBlock(
+    allocator: std.mem.Allocator,
+    accumulated: *std.ArrayListUnmanaged(u8),
+    in_reasoning: *bool,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !void {
+    if (!in_reasoning.*) return;
+    in_reasoning.* = false;
+    try accumulated.appendSlice(allocator, THINK_CLOSE_TAG);
+    callback(ctx, root.StreamChunk.textDelta(THINK_CLOSE_TAG));
+}
+
+fn appendDeltaContent(
+    allocator: std.mem.Allocator,
+    accumulated: *std.ArrayListUnmanaged(u8),
+    in_reasoning: *bool,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+    content: DeltaContent,
+) !void {
+    switch (content) {
+        .text => |text| {
+            try closeReasoningBlock(allocator, accumulated, in_reasoning, callback, ctx);
+            try accumulated.appendSlice(allocator, text);
+            callback(ctx, root.StreamChunk.textDelta(text));
+        },
+        .reasoning => |reasoning| {
+            if (!in_reasoning.*) {
+                in_reasoning.* = true;
+                try accumulated.appendSlice(allocator, THINK_OPEN_TAG);
+                callback(ctx, root.StreamChunk.textDelta(THINK_OPEN_TAG));
+            }
+            try accumulated.appendSlice(allocator, reasoning);
+            callback(ctx, root.StreamChunk.textDelta(reasoning));
+        },
+    }
+}
+
 /// Parse a single SSE line in OpenAI streaming format.
 ///
 /// Handles:
@@ -316,7 +358,7 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     }
 
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
-        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON: {s} | Error: {s}", .{json_str, @errorName(err)});
+        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON: {s} | Error: {s}", .{ json_str, @errorName(err) });
         return error.InvalidSseJson;
     };
     defer parsed.deinit();
@@ -506,12 +548,6 @@ pub fn curlStream(
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
     var in_reasoning = false;
-    defer {
-        if (in_reasoning) {
-            accumulated.appendSlice(allocator, "</think>") catch {};
-            callback(ctx, root.StreamChunk.textDelta("</think>"));
-        }
-    }
 
     outer: while (true) {
         const n = stdout_file.read(&read_buf) catch |err| {
@@ -570,26 +606,7 @@ pub fn curlStream(
                 switch (result) {
                     .delta => |content| {
                         defer content.deinit(allocator);
-                        switch (content) {
-                            .text => |text| {
-                                if (in_reasoning) {
-                                    in_reasoning = false;
-                                    try accumulated.appendSlice(allocator, "</think>");
-                                    callback(ctx, root.StreamChunk.textDelta("</think>"));
-                                }
-                                try accumulated.appendSlice(allocator, text);
-                                callback(ctx, root.StreamChunk.textDelta(text));
-                            },
-                            .reasoning => |reasoning| {
-                                if (!in_reasoning) {
-                                    in_reasoning = true;
-                                    try accumulated.appendSlice(allocator, "<think>");
-                                    callback(ctx, root.StreamChunk.textDelta("<think>"));
-                                }
-                                try accumulated.appendSlice(allocator, reasoning);
-                                callback(ctx, root.StreamChunk.textDelta(reasoning));
-                            },
-                        }
+                        try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
                     },
                     .usage => |u| stream_usage = u,
                     .done => {
@@ -619,26 +636,7 @@ pub fn curlStream(
             switch (result) {
                 .delta => |content| {
                     defer content.deinit(allocator);
-                    switch (content) {
-                        .text => |text| {
-                            if (in_reasoning) {
-                                in_reasoning = false;
-                                try accumulated.appendSlice(allocator, "</think>");
-                                callback(ctx, root.StreamChunk.textDelta("</think>"));
-                            }
-                            try accumulated.appendSlice(allocator, text);
-                            callback(ctx, root.StreamChunk.textDelta(text));
-                        },
-                        .reasoning => |reasoning| {
-                            if (!in_reasoning) {
-                                in_reasoning = true;
-                                try accumulated.appendSlice(allocator, "<think>");
-                                callback(ctx, root.StreamChunk.textDelta("<think>"));
-                            }
-                            try accumulated.appendSlice(allocator, reasoning);
-                            callback(ctx, root.StreamChunk.textDelta(reasoning));
-                        },
-                    }
+                    try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
                 },
                 .usage => |u| stream_usage = u,
                 .done => {},
@@ -663,6 +661,7 @@ pub fn curlStream(
         log.err("curlStream child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
+            try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeStreamResult(allocator, accumulated.items, stream_usage);
         }
@@ -675,6 +674,7 @@ pub fn curlStream(
         .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
+                try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, stream_usage);
             }
@@ -683,6 +683,7 @@ pub fn curlStream(
         else => {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
+                try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeStreamResult(allocator, accumulated.items, stream_usage);
             }
@@ -691,6 +692,7 @@ pub fn curlStream(
     }
 
     // Signal stream completion only after curl exits successfully.
+    try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
     return finalizeStreamResult(allocator, accumulated.items, stream_usage);
 }
@@ -1138,6 +1140,41 @@ test "extractDeltaContent prefers visible content over reasoning_content" {
     const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"final answer\",\"reasoning_content\":\"private\"}}]}")).?;
     defer d.deinit(allocator);
     try std.testing.expectEqualStrings("final answer", d.text);
+}
+
+test "appendDeltaContent closes reasoning before final" {
+    const Collector = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var collector = Collector{};
+    defer collector.buf.deinit(allocator);
+    var accumulated: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated.deinit(allocator);
+
+    var in_reasoning = false;
+    const content = DeltaContent{ .reasoning = try allocator.dupe(u8, "private") };
+    defer content.deinit(allocator);
+
+    try appendDeltaContent(allocator, &accumulated, &in_reasoning, Collector.callback, @ptrCast(&collector), content);
+    try closeReasoningBlock(allocator, &accumulated, &in_reasoning, Collector.callback, @ptrCast(&collector));
+    Collector.callback(@ptrCast(&collector), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expect(!in_reasoning);
+    try std.testing.expectEqualStrings("<think>private</think>", accumulated.items);
+    try std.testing.expectEqualStrings("<think>private</think>", collector.buf.items);
 }
 
 test "extractDeltaContent empty reasoning_content returns null" {

@@ -909,7 +909,7 @@ pub const OpenAiCompatibleProvider = struct {
         needs_free: bool,
     };
 
-    // NOTE: ThinkStripStreamCtx removed. 
+    // NOTE: ThinkStripStreamCtx removed.
     // Stripping/formatting is now handled by streaming.zig filters.
 
     fn extractMessageText(allocator: std.mem.Allocator, msg_obj: std.json.ObjectMap) !?[]const u8 {
@@ -2130,7 +2130,6 @@ test "buildChatRequestBody appends session_id and extra_body_params" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"seed\":321") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"metadata\":{\"tier\":\"team\"}") != null);
 }
-
 
 test "parseTextResponse empty choices" {
     const body =

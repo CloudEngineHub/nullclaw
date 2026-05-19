@@ -597,6 +597,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (parsed_args.skill_name) |sname| {
             _ = try commands.activateSkillByName(&agent, sname);
         }
+        if (cost_tracker) |*c_tracker| {
+            agent.usage_record_callback = cliUsageRecordCallback;
+            agent.usage_record_ctx = @ptrCast(c_tracker);
+        }
         defer agent.deinit();
 
         // Enable streaming if provider supports it.

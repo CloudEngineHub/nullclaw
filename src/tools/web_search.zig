@@ -363,7 +363,6 @@ pub fn formatSearxngResults(allocator: std.mem.Allocator, json_body: []const u8,
     return search_providers.searxng.formatResults(allocator, json_body, query);
 }
 
-
 // ══════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════
@@ -621,7 +620,6 @@ test "formatSearxngResults parses valid JSON" {
     try testing.expect(std.mem.indexOf(u8, result.output, "1. SearXNG") != null);
     try testing.expect(std.mem.indexOf(u8, result.output, "https://docs.searxng.org") != null);
 }
-
 
 test "formatBraveResults empty results" {
     const json = "{\"web\":{\"results\":[]}}";

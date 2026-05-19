@@ -1426,7 +1426,7 @@ pub const SessionManager = struct {
                 }
             }
         }
-        if (self.config.diagnostics.token_usage_ledger_enabled) {
+        if (self.config.diagnostics.token_usage_ledger_enabled or self.config.cost.enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
         }
@@ -1599,6 +1599,13 @@ pub const SessionManager = struct {
         self.usage_log_mutex.lock();
         defer self.usage_log_mutex.unlock();
 
+        if (self.cost_tracker) |*tracker| {
+            const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
+            tracker.recordUsage(usage) catch |err| {
+                log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
+            };
+        }
+
         const ledger_path = self.usageLedgerPath() orelse return;
         defer self.allocator.free(ledger_path);
 
@@ -1609,13 +1616,6 @@ pub const SessionManager = struct {
         const now_ts = std_compat.time.timestamp();
         const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
-
-        if (self.cost_tracker) |*tracker| {
-            const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
-            tracker.recordUsage(usage) catch |err| {
-                log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
-            };
-        }
 
         const record_line = std.fmt.allocPrint(
             self.allocator,
@@ -2889,6 +2889,45 @@ test "usage ledger appends records when retention limits are disabled" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\n"));
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":101") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":102") != null);
+}
+
+test "cost tracker records usage when diagnostics ledger is disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.cost.enabled = true;
+    cfg.diagnostics.token_usage_ledger_enabled = false;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 201,
+        .provider = "p1",
+        .model = "gpt-4o",
+        .usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 },
+        .success = true,
+    });
+
+    const tracker = if (sm.cost_tracker) |*value| value else return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 1), tracker.requestCount());
+
+    const file = try std_compat.fs.openFileAbsolute(tracker.storage_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "\"model\":\"gpt-4o\"") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"input_tokens\":10") != null);
 }
 
 test "usage ledger resets when max line limit is reached" {

@@ -131,7 +131,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return .elevated;
     if (isSlashName(cmd, "bash")) return .bash;
     if (isSlashName(cmd, "poll")) return .poll;
-    if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills")) return .skill;
+    if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills") or isSlashName(cmd, "iskill")) return .skill;
     if (isSlashName(cmd, "doctor")) return .doctor;
     if (isSlashName(cmd, "memory") or isSlashName(cmd, "mem")) return .memory;
     if (isSlashName(cmd, "cost") or isSlashName(cmd, "costs") or isSlashName(cmd, "pricing")) return .cost;
@@ -1025,6 +1025,15 @@ test "planTurnInput keeps known slash commands local-only" {
 
 test "planTurnInput keeps /menu on local-only path" {
     const plan = planTurnInput("/menu");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "planTurnInput keeps interactive skill activation local-only" {
+    // Regression: /iskill must stay on the local handler path so it can arm an
+    // interactive session skill instead of being treated as unknown slash text.
+    const plan = planTurnInput("/iskill news-digest");
     try std.testing.expect(!plan.clear_session);
     try std.testing.expect(plan.invoke_local_handler);
     try std.testing.expect(plan.llm_user_message == null);

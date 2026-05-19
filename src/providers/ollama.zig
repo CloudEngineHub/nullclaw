@@ -380,7 +380,7 @@ pub const OllamaProvider = struct {
         const resp_body = root.curlPostTimed(allocator, url, body, headers, 0) catch return error.OllamaApiError;
         defer allocator.free(resp_body);
 
-        const response = try parseResponse(allocator, resp_body);
+        var response = try parseResponse(allocator, resp_body);
         defer response.deinit(allocator);
         return try allocator.dupe(u8, response.content orelse "");
     }
@@ -574,7 +574,7 @@ test "parseResponse extracts content" {
     const body =
         \\{"message":{"role":"assistant","content":"Hello from Ollama!"}}
     ;
-    const result = try OllamaProvider.parseResponse(std.testing.allocator, body);
+    var result = try OllamaProvider.parseResponse(std.testing.allocator, body);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Hello from Ollama!", result.content.?);
 }
@@ -942,7 +942,7 @@ test "parseResponse with tool calls produces formatted JSON" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"shell","arguments":{"command":"ls"}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
+    var result = try OllamaProvider.parseResponse(alloc, body);
     defer result.deinit(alloc);
 
     // Should be valid JSON with tool_calls
@@ -956,7 +956,7 @@ test "parseResponse thinking-only returns fallback message" {
     const body =
         \\{"message":{"role":"assistant","content":"","thinking":"Let me reason about this carefully..."}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
+    var result = try OllamaProvider.parseResponse(alloc, body);
     defer result.deinit(alloc);
 
     try std.testing.expect(std.mem.indexOf(u8, result.content.?, "I was thinking about this") != null);
@@ -968,7 +968,7 @@ test "parseResponse with tool_call nested wrapper unwraps correctly" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"shell","arguments":{"command":"whoami"}}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
+    var result = try OllamaProvider.parseResponse(alloc, body);
     defer result.deinit(alloc);
 
     // The formatted output should contain the unwrapped tool name "shell"
@@ -982,7 +982,7 @@ test "parseResponse normalizes scheduler_tool alias to schedule" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"scheduler_tool","arguments":{"action":"list"}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
+    var result = try OllamaProvider.parseResponse(alloc, body);
     defer result.deinit(alloc);
 
     try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"schedule\"") != null);
@@ -994,7 +994,7 @@ test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"scheduler_tool","arguments":{"action":"list"}}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
+    var result = try OllamaProvider.parseResponse(alloc, body);
     defer result.deinit(alloc);
 
     try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"schedule\"") != null);
