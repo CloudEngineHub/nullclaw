@@ -737,6 +737,18 @@ pub fn isGenericGatewayEndpointAuthorized(
     return guard.matchesStoredToken(token);
 }
 
+fn shouldSyncWebhookForWorker(
+    config_opt: ?*const Config,
+    pairing_guard: ?*const PairingGuard,
+    bearer_token: ?[]const u8,
+) bool {
+    const cfg = config_opt orelse return false;
+    if (!cfg.gateway.webhook_sync_for_workers) return false;
+    const guard = pairing_guard orelse return false;
+    const token = bearer_token orelse return false;
+    return guard.matchesConfiguredToken(token);
+}
+
 fn isPairEndpointAllowed(public_bind: bool, client_identifier: []const u8) bool {
     return !public_bind or !isPublicBindHost(client_identifier);
 }
@@ -5482,7 +5494,11 @@ pub fn run(
             }
         }
 
-        if (needs_local_agent) {
+        // In daemon mode (`event_bus` is present), inbound processing usually
+        // stays on the bus path. `webhook_sync_for_workers` opts paired-token
+        // /webhook callers into the synchronous session-manager path, so that
+        // mode needs the same local runtime as standalone gateway mode.
+        if (needs_local_agent or cfg.gateway.webhook_sync_for_workers) {
             local_agent_runtime_opt = try initLocalAgentRuntime(allocator, cfg, runtime_observer.?, event_bus);
             if (local_agent_runtime_opt) |*runtime| {
                 maybeProbeA2aVision(&runtime.session_mgr, allocator, cfg);
@@ -5820,9 +5836,20 @@ pub fn run(
                             var routing = webhookRouting(req_allocator, b, bearer, config_opt);
                             defer routing.deinit(req_allocator);
 
-                            if (state.event_bus) |eb| {
+                            // Worker-style sync path opt-in: when the request authenticates with
+                            // a token from `paired_tokens` and `gateway.webhook_sync_for_workers`
+                            // is set, take the synchronous session-manager branch instead of the
+                            // event bus. This gives NullBoiler-style orchestrators the
+                            // `{"status":"ok","response":"..."}` response their dispatch contract
+                            // expects (Gap 3 from `docs/integration-analysis.md`). Channel
+                            // webhooks (no paired-token bearer) continue through the bus path
+                            // unchanged.
+                            const sync_for_worker = shouldSyncWebhookForWorker(config_opt, pairing_guard, bearer);
+                            const use_bus = state.event_bus != null and !sync_for_worker;
+
+                            if (use_bus) {
                                 _ = publishToBus(
-                                    eb,
+                                    state.event_bus.?,
                                     state.allocator,
                                     "webhook",
                                     routing.sender_id,
@@ -6442,6 +6469,36 @@ test "ensureSafeGatewayBind allows public host when tunnel is active" {
         .allocator = std.testing.allocator,
     };
     try ensureSafeGatewayBind("0.0.0.0", &cfg, "https://public.example");
+}
+
+test "shouldSyncWebhookForWorker requires opt-in and stored token" {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{"worker-token"});
+    defer guard.deinit();
+
+    // Regression: worker webhooks must bypass the bus only for the explicit
+    // paired-token opt-in, not for missing or unrelated bearer credentials.
+    try std.testing.expect(!shouldSyncWebhookForWorker(&cfg, &guard, "worker-token"));
+    cfg.gateway.webhook_sync_for_workers = true;
+    try std.testing.expect(shouldSyncWebhookForWorker(&cfg, &guard, "worker-token"));
+    try std.testing.expect(!shouldSyncWebhookForWorker(&cfg, &guard, "wrong-token"));
+    try std.testing.expect(!shouldSyncWebhookForWorker(&cfg, &guard, null));
+    try std.testing.expect(!shouldSyncWebhookForWorker(&cfg, null, "worker-token"));
+    try std.testing.expect(!shouldSyncWebhookForWorker(null, &guard, "worker-token"));
+
+    _ = try guard.setPairingCode("123456");
+    const pair_result = guard.attemptPair("123456");
+    const runtime_token = switch (pair_result) {
+        .paired => |token| token,
+        else => return error.TestUnexpectedResult,
+    };
+    defer std.testing.allocator.free(runtime_token);
+    try std.testing.expect(guard.matchesStoredToken(runtime_token));
+    try std.testing.expect(!shouldSyncWebhookForWorker(&cfg, &guard, runtime_token));
 }
 
 test "idempotency store rejects duplicate key" {

@@ -1542,6 +1542,17 @@ pub const GatewayConfig = struct {
     /// Default 30s. Raise this when accepting large payloads (e.g. images)
     /// over slow or high-latency connections.
     request_timeout_secs: u64 = 30,
+    /// When true, /webhook requests authenticated with a token from
+    /// `paired_tokens` are routed through the synchronous session-manager
+    /// path instead of being published to the event bus. The caller then
+    /// receives `{"status":"ok","response":"...","thread_events":[...]}`,
+    /// which is the response shape the NullBoiler dispatch contract
+    /// requires from a worker (see `docs/integration-analysis.md` Gap 3).
+    /// Unauthenticated webhooks and webhooks from non-paired bearers
+    /// continue to take the bus path, so existing channel integrations
+    /// (Telegram, Discord, Slack, …) are unaffected. Default false to keep
+    /// behavior unchanged for existing deployments.
+    webhook_sync_for_workers: bool = false,
 };
 
 // ── A2A (Agent-to-Agent) protocol config ────────────────────────

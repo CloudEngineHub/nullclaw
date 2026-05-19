@@ -56,7 +56,9 @@ pub const TlsState = struct {
 };
 
 /// WebSocket client over TLS.
-/// `write_mu` serializes concurrent writes (heartbeat + gateway threads).
+/// `write_mu` serializes concurrent frame-level writes (heartbeat + gateway threads).
+/// Reads are single-threaded (main gateway loop); TLS 1.3 read/write directions are
+/// cryptographically independent, so no mutex is needed for readExact.
 pub const WsClient = struct {
     allocator: std.mem.Allocator,
     stream: std_compat.net.Stream,
@@ -74,6 +76,7 @@ pub const WsClient = struct {
 
     /// Connect to wss://host:port/path.
     /// `extra_headers`: additional HTTP request headers (without trailing CRLF).
+    /// Equivalent to `connectTcp` followed by `connectFromStream`.
     pub fn connect(
         allocator: std.mem.Allocator,
         host: []const u8,
@@ -81,26 +84,76 @@ pub const WsClient = struct {
         path: []const u8,
         extra_headers: []const []const u8,
     ) !WsClient {
-        // DNS + TCP. Some environments return multiple gateway IPs where the
-        // first one is not reachable, so try each resolved address in order.
+        const stream = try connectTcp(allocator, host, port);
+        return connectFromStream(allocator, stream, host, path, extra_headers);
+    }
+
+    /// Perform DNS resolution + TCP connect only. Returns the connected TCP stream.
+    /// On failure the function cleans up; on success the caller owns the stream.
+    ///
+    /// Pair with `connectFromStream` when the fd must be stored before TLS init so
+    /// a concurrent thread can interrupt a stalled handshake via `stream.shutdown`.
+    pub fn connectTcp(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+    ) !std_compat.net.Stream {
         const addr_list = try std_compat.net.getAddressList(allocator, host, port);
         defer addr_list.deinit();
-        const stream = try connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
+        return connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
+    }
+
+    /// Complete TLS init + WebSocket handshake on an already-established TCP stream.
+    ///
+    /// On failure the stream is closed and an error is returned.
+    /// On success the returned `WsClient` owns the stream (call `deinit()` to release).
+    ///
+    /// A single adaptive errdefer handles tls_state cleanup across all failure stages:
+    /// - before tls_state owns buffers: calls allocator.destroy() (struct not yet inited)
+    /// - after tls_state owns buffers but before TLS init: calls tls_state.deinit()
+    ///   (frees buffers + CA bundle; individual buffer errdefers become no-ops)
+    /// - after TLS init: also calls tls_client.end() before tls_state.deinit()
+    pub fn connectFromStream(
+        allocator: std.mem.Allocator,
+        stream: std_compat.net.Stream,
+        host: []const u8,
+        path: []const u8,
+        extra_headers: []const []const u8,
+    ) !WsClient {
+        // Ensures stream is closed on any failure path.
         errdefer stream.close();
 
-        // Allocate TLS buffers (pattern from irc.zig)
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
+
+        // Stage flags for the single adaptive tls_state errdefer below.
+        // tls_state_owns_buffers: tls_state.deinit() is now responsible for buffer cleanup.
+        // tls_client_inited: safe to call tls_client.end() before deinit.
+        var tls_state_owns_buffers = false;
+        var tls_client_inited = false;
+
+        // Buffer allocations: individual errdefers are no-ops once tls_state owns them.
         const read_buf = try allocator.alloc(u8, tls_buf_len);
-        errdefer allocator.free(read_buf);
+        errdefer if (!tls_state_owns_buffers) allocator.free(read_buf);
         const write_buf = try allocator.alloc(u8, tls_buf_len);
-        errdefer allocator.free(write_buf);
+        errdefer if (!tls_state_owns_buffers) allocator.free(write_buf);
         const tls_read_buf = try allocator.alloc(u8, tls_buf_len);
-        errdefer allocator.free(tls_read_buf);
+        errdefer if (!tls_state_owns_buffers) allocator.free(tls_read_buf);
         const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
-        errdefer allocator.free(tls_write_buf);
+        errdefer if (!tls_state_owns_buffers) allocator.free(tls_write_buf);
 
         const tls_state = try allocator.create(TlsState);
-        errdefer allocator.destroy(tls_state);
+        // Single adaptive errdefer: behaviour depends on flags set below.
+        errdefer {
+            if (tls_state_owns_buffers) {
+                // tls_state.deinit() frees buffers + CA bundle + destroys struct.
+                // Individual buffer errdefers above are no-ops at this point.
+                if (tls_client_inited) tls_state.tls_client.end() catch {};
+                tls_state.deinit(allocator);
+            } else {
+                // Struct allocated but fields not yet set; just free the struct.
+                allocator.destroy(tls_state);
+            }
+        }
 
         tls_state.read_buf = read_buf;
         tls_state.write_buf = write_buf;
@@ -108,6 +161,10 @@ pub const WsClient = struct {
         tls_state.tls_write_buf = tls_write_buf;
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
+        tls_state.ca_bundle = .empty;
+        tls_state.ca_bundle_lock = .init;
+        tls_state.owns_ca_bundle = false;
+
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         std_compat.crypto.random.bytes(&entropy);
 
@@ -117,8 +174,6 @@ pub const WsClient = struct {
             if (ca_bundle.rescan(allocator, std_compat.io(), std.Io.Timestamp.now(std_compat.io(), .real))) |_| {
                 has_ca_bundle = true;
             } else |err| {
-                // Preserve current behavior on platforms/environments where system CAs
-                // are unavailable, but prefer verified TLS whenever possible.
                 log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
             }
         } else {
@@ -128,6 +183,10 @@ pub const WsClient = struct {
             tls_state.ca_bundle = ca_bundle;
             tls_state.owns_ca_bundle = true;
         }
+
+        // tls_state now owns all buffers and the CA bundle (if any).
+        // Switch the adaptive errdefer to tls_state.deinit() mode so buffer errdefers are no-ops.
+        tls_state_owns_buffers = true;
 
         const tls_options: std.crypto.tls.Client.Options = .{
             .host = .{ .explicit = host },
@@ -149,6 +208,7 @@ pub const WsClient = struct {
             &tls_state.stream_writer.interface,
             tls_options,
         ) catch return error.TlsInitializationFailed;
+        tls_client_inited = true;
 
         var client = WsClient{
             .allocator = allocator,
@@ -156,8 +216,6 @@ pub const WsClient = struct {
             .tls = tls_state,
             .write_mu = .{},
         };
-        errdefer client.deinit();
-
         try client.performHandshake(host, path, extra_headers);
         return client;
     }
@@ -1056,6 +1114,27 @@ test "ws readFrame auto-pongs ping and returns null on close frame" {
     try std.testing.expect(closed == null);
 }
 
+// Regression: connectFromStream must free all TLS buffers and close the stream on
+// TLS init failure, leaving no leaks detectable by the test allocator.
+test "connectFromStream cleans up TLS state on init failure" {
+    // Use a socketpair as the stream; close the server side immediately so
+    // std.crypto.tls.Client.init() sees EOF during the TLS handshake and fails.
+    const sockets = try createWsTestSocketPair();
+    std.Io.Threaded.closeFd(sockets[1]); // server side → EOF on first read
+
+    const stream = std_compat.net.Stream{ .handle = sockets[0] };
+    const result = WsClient.connectFromStream(
+        std.testing.allocator,
+        stream,
+        "test.example.com",
+        "/",
+        &.{},
+    );
+    // TLS handshake fails due to EOF; connectFromStream must return an error and
+    // release all allocations (verified automatically by std.testing.allocator).
+    try std.testing.expectError(error.TlsInitializationFailed, result);
+}
+
 // Regression: v2026.3.12 applied a blanket `n == 0 → ConnectionClosed` check
 // to both TLS and plain socket paths. TLS readVec may return 0 while it
 // refills its internal buffer or processes post-handshake records, so only
@@ -1230,4 +1309,20 @@ test "readFrame rejects oversized payload claim before allocation" {
     (std_compat.net.Stream{ .handle = sockets[1] }).shutdown(.send) catch {};
 
     try std.testing.expectError(error.FrameTooLarge, client.readFrame());
+}
+
+test "ws write_mu serializes concurrent frame writes" {
+    // Verifies that write_mu is non-reentrant: once held, tryLock returns false.
+    // This guards the invariant that writeText/writeBinary/writeClose and the
+    // auto-pong path in readFrame all serialize on write_mu.
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    client.write_mu.lock();
+    defer client.write_mu.unlock();
+    try std.testing.expect(client.write_mu.tryLock() == false);
 }

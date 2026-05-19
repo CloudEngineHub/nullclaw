@@ -39,6 +39,7 @@ const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const thread_stacks = @import("thread_stacks.zig");
+const cost_mod = @import("cost.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -309,6 +310,7 @@ pub const SessionManager = struct {
     observer: Observer,
     policy: ?*const SecurityPolicy = null,
     subagent_manager: ?*@import("subagent.zig").SubagentManager = null,
+    cost_tracker: ?cost_mod.CostTracker = null,
 
     /// Result of the startup vision probe against the configured model.
     /// null = not yet confirmed (probe not run, skipped, or inconclusive), true = model accepts images,
@@ -375,12 +377,14 @@ pub const SessionManager = struct {
             .verified_bindings = .{},
             .used_claim_nonces = .{},
             .claim_attempts = .{},
+            .cost_tracker = if (config.cost.enabled) cost_mod.CostTracker.init(allocator, config.workspace_dir, config.cost.enabled, config.cost.daily_limit_usd, config.cost.monthly_limit_usd, config.cost.warn_at_percent) else null,
         };
         manager.loadClaimState();
         return manager;
     }
 
     pub fn deinit(self: *SessionManager) void {
+        if (self.cost_tracker) |*tracker| tracker.deinit();
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -1456,7 +1460,7 @@ pub const SessionManager = struct {
                 }
             }
         }
-        if (self.config.diagnostics.token_usage_ledger_enabled) {
+        if (self.config.diagnostics.token_usage_ledger_enabled or self.config.cost.enabled) {
             agent.usage_record_callback = usageRecordForwarder;
             agent.usage_record_ctx = @ptrCast(self);
         }
@@ -1642,6 +1646,13 @@ pub const SessionManager = struct {
     fn appendUsageRecord(self: *SessionManager, record: Agent.UsageRecord) void {
         self.usage_log_mutex.lock();
         defer self.usage_log_mutex.unlock();
+
+        if (self.cost_tracker) |*tracker| {
+            const usage = cost_mod.TokenUsage.fromProviders(record.model, record.usage);
+            tracker.recordUsage(usage) catch |err| {
+                log.err("Failed to record usage in CostTracker: {s}", .{@errorName(err)});
+            };
+        }
 
         const ledger_path = self.usageLedgerPath() orelse return;
         defer self.allocator.free(ledger_path);
@@ -2961,6 +2972,45 @@ test "usage ledger appends records when retention limits are disabled" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\n"));
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":101") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":102") != null);
+}
+
+test "cost tracker records usage when diagnostics ledger is disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.cost.enabled = true;
+    cfg.diagnostics.token_usage_ledger_enabled = false;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 201,
+        .provider = "p1",
+        .model = "gpt-4o",
+        .usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 },
+        .success = true,
+    });
+
+    const tracker = if (sm.cost_tracker) |*value| value else return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 1), tracker.requestCount());
+
+    const file = try std_compat.fs.openFileAbsolute(tracker.storage_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "\"model\":\"gpt-4o\"") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"input_tokens\":10") != null);
 }
 
 test "usage ledger resets when max line limit is reached" {

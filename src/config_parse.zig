@@ -2204,6 +2204,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("request_timeout_secs")) |v| {
                 if (v == .integer and v.integer >= 0) self.gateway.request_timeout_secs = @intCast(v.integer);
             }
+            if (gw.object.get("webhook_sync_for_workers")) |v| {
+                if (v == .bool) self.gateway.webhook_sync_for_workers = v.bool;
+            }
         }
     }
 

@@ -31,6 +31,7 @@ const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const util = @import("../util.zig");
 const verbose_mod = @import("../verbose.zig");
+const cost_mod = @import("../cost.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -347,6 +348,8 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    last_system_prompt_bytes: usize = 0,
+    last_history_bytes: usize = 0,
     status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
@@ -407,6 +410,9 @@ pub const Agent = struct {
 
     /// Total tokens used across all turns.
     total_tokens: u64 = 0,
+
+    /// Total cost in USD across all turns.
+    total_cost_usd: f64 = 0,
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
@@ -638,6 +644,7 @@ pub const Agent = struct {
             .default_exec_ask = resolved_exec_ask,
             .exec_ask = resolved_exec_ask,
             .history = .empty,
+            .usage_mode = if (cfg.cost.enabled) .full else .off,
             .total_tokens = 0,
             .has_system_prompt = false,
             .last_turn_compacted = false,
@@ -955,9 +962,6 @@ pub const Agent = struct {
             "i will attempt",
             "let me attempt",
             // check / look / verify
-            "i'll check",
-            "i will check",
-            "let me check",
             "i'll look into",
             "i will look into",
             "let me look into",
@@ -967,6 +971,9 @@ pub const Agent = struct {
             "i'll verify",
             "i will verify",
             "let me verify",
+            "i'll check",
+            "i will check",
+            "let me check",
             // fetch / get / retrieve
             "i'll fetch",
             "i will fetch",
@@ -993,6 +1000,14 @@ pub const Agent = struct {
             "i'll search",
             "i will search",
             "let me search",
+            "i'll perform a search",
+            "i will perform a search",
+            "let me perform a search",
+            "give me a moment",
+            "give me a second",
+            "one moment",
+            "searching...",
+            "checking the web",
             // read / open / load
             "i'll read",
             "i will read",
@@ -1046,10 +1061,49 @@ pub const Agent = struct {
             "Сейчас перепроверю",
             "попробую ещё раз",
             "Попробую ещё раз",
+            "сейчас поищу",
+            "Сейчас поищу",
+            "выполню поиск",
+            "Выполню поиск",
+            "сейчас найду",
+            "Сейчас найду",
+            "дай мне минуту",
+            "Дай мне минуту",
+            "дайте мне минуту",
+            "Дайте мне минуту",
+            "дай мне минутку",
+            "Дай мне минутку",
+            "дайте мне минутку",
+            "Дайте мне минутку",
+            "одну минуту",
+            "Одну минуту",
+            "одну минутку",
+            "Одну минутку",
+            "подожди",
+            "Подожди",
+            "подождите",
+            "Подождите",
+            "один момент",
+            "Один момент",
+            "посмотрю в интернете",
+            "Посмотрю в интернете",
+            "проверю информацию",
+            "Проверю информацию",
+            "сейчас проверю",
+            "Сейчас проверю",
+            "проведу поиск",
+            "Проведу поиск",
+            "выполню поиск",
+            "Выполню поиск",
+            "начинаю поиск",
+            "Начинаю поиск",
+            "поищу информацию",
+            "Поищу информацию",
         };
         inline for (exact_patterns) |pattern| {
             if (std.mem.indexOf(u8, text, pattern) != null) return true;
         }
+
         return false;
     }
 
@@ -2030,6 +2084,18 @@ pub const Agent = struct {
         // Keep the user message retained even if provider/tool steps fail.
         try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
+        var sys_bytes: usize = 0;
+        var hist_bytes: usize = 0;
+        for (self.history.items) |msg| {
+            if (msg.role == .system) {
+                sys_bytes += msg.content.len;
+            } else {
+                hist_bytes += msg.content.len;
+            }
+        }
+        self.last_system_prompt_bytes = sys_bytes;
+        self.last_history_bytes = hist_bytes;
+
         // ── Response cache check ──
         const response_cache_allowed = self.responseCacheSafeForTurn(safe_user_message);
         if (response_cache_allowed) {
@@ -2369,6 +2435,7 @@ pub const Agent = struct {
             response.usage = normalized_usage;
 
             self.total_tokens += normalized_usage.total_tokens;
+            self.total_cost_usd += cost_mod.TokenUsage.fromProviders(turn_model_name, normalized_usage).cost();
             self.last_turn_usage = normalized_usage;
             if (normalized_usage.total_tokens > 0) {
                 const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_usage.total_tokens };
@@ -2452,7 +2519,7 @@ pub const Agent = struct {
                     if (empty_response_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.") });
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n") });
                         self.trimHistory();
                         empty_response_retry_count += 1;
                         continue;
@@ -2786,6 +2853,7 @@ pub const Agent = struct {
         }
         summary_response.usage = normalized_summary_usage;
         self.total_tokens += normalized_summary_usage.total_tokens;
+        self.total_cost_usd += cost_mod.TokenUsage.fromProviders(self.model_name, normalized_summary_usage).cost();
         self.last_turn_usage = normalized_summary_usage;
         if (normalized_summary_usage.total_tokens > 0) {
             const usage_metric = observability.ObserverMetric{ .tokens_used = normalized_summary_usage.total_tokens };
@@ -9474,6 +9542,13 @@ test "Agent shouldForceActionFollowThrough ignores conclusory english statements
 test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("Сейчас попробую переснять и отправить файл."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("сейчас проверю и вернусь с результатом"));
+}
+
+test "Agent shouldForceActionFollowThrough ignores russian duration nouns" {
+    // Regression: bare words like "минуту" and "секунду" are too broad for
+    // substring matching and can appear in ordinary final answers.
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Запустите таймер на минуту."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Пауза должна длиться одну секунду после запуска сервиса."));
 }
 
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
