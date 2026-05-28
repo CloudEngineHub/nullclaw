@@ -1,17 +1,10 @@
 const std = @import("std");
 const std_compat = @import("compat");
-const builtin = @import("builtin");
 const root = @import("root.zig");
-const fs_compat = @import("../fs_compat.zig");
 const http_util = @import("../http_util.zig");
-const platform = @import("../platform.zig");
 const error_classify = @import("error_classify.zig");
 const verbose = @import("../verbose.zig");
 const log = std.log.scoped(.provider_sse);
-
-// Keep large request bodies out of argv. On Linux, a single oversized `-d`
-// argument can hit execve limits long before the total ARG_MAX budget.
-const MAX_INLINE_CURL_BODY_BYTES: usize = 64 * 1024;
 
 var curl_fail_fast_arg_mutex: std_compat.sync.Mutex = .{};
 var curl_fail_with_body_supported_cache: ?bool = null;
@@ -114,80 +107,6 @@ pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
         argv_buf[argc.*] = arg;
         argc.* += 1;
     }
-}
-
-const CurlBodyArg = struct {
-    arg: []const u8,
-    temp_path_buf: [std_compat.fs.max_path_bytes]u8 = undefined,
-    temp_path_len: usize = 0,
-    uses_temp_file: bool = false,
-
-    fn deinit(self: *const CurlBodyArg, allocator: std.mem.Allocator) void {
-        if (!self.uses_temp_file) return;
-        std_compat.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
-        allocator.free(self.arg);
-    }
-};
-
-fn prepareCurlBodyArg(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-    log_enabled: bool,
-) !CurlBodyArg {
-    const should_use_temp_file = builtin.os.tag == .windows or body.len > MAX_INLINE_CURL_BODY_BYTES;
-    if (!should_use_temp_file) {
-        return .{ .arg = body };
-    }
-
-    const debug_log = std.log.scoped(.sse);
-    var prepared: CurlBodyArg = .{ .arg = body };
-
-    const tmp_dir_path = platform.getTempDir(allocator) catch
-        return error.TempDirNotFound;
-    defer allocator.free(tmp_dir_path);
-
-    var tmp_dir = std_compat.fs.openDirAbsolute(tmp_dir_path, .{}) catch
-        return error.TempDirNotFound;
-    defer tmp_dir.close();
-
-    const body_path = std.fmt.bufPrint(
-        &prepared.temp_path_buf,
-        "{s}{s}sse_body_{d}.tmp",
-        .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.time.timestamp() },
-    ) catch return error.PathTooLong;
-    prepared.temp_path_len = body_path.len;
-    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
-
-    var tmp_file = tmp_dir.createFile(
-        body_path[tmp_dir_path.len + 1 ..],
-        .{ .truncate = true, .exclusive = false },
-    ) catch return error.TempFileCreateFailed;
-
-    tmp_file.writeAll(body) catch {
-        tmp_file.close();
-        return error.TempFileWriteFailed;
-    };
-    tmp_file.close();
-
-    if (log_enabled) {
-        debug_log.info("Using temp file for curl body: {s}, body_len={d}", .{ body_path, body.len });
-    }
-
-    const verify_file = std_compat.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
-    defer verify_file.close();
-    const verify_stat = fs_compat.stat(verify_file) catch return error.TempFileCreateFailed;
-    if (log_enabled) {
-        debug_log.info("Temp body file size: {d} bytes", .{verify_stat.size});
-    }
-
-    for (prepared.temp_path_buf[0..prepared.temp_path_len]) |*c| {
-        if (c.* == '\\') c.* = '/';
-    }
-
-    prepared.arg = try std.fmt.allocPrint(allocator, "@{s}", .{prepared.temp_path_buf[0..prepared.temp_path_len]});
-    errdefer allocator.free(prepared.arg);
-    prepared.uses_temp_file = true;
-    return prepared;
 }
 
 /// Content delta from an SSE chunk.
@@ -1005,31 +924,6 @@ test "parseSseLine valid delta without optional space" {
         },
         else => return error.TestUnexpectedResult,
     }
-}
-
-test "prepareCurlBodyArg keeps small bodies inline except on Windows" {
-    const allocator = std.testing.allocator;
-    const body = [_]u8{'x'} ** 4096;
-    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
-    defer prepared.deinit(allocator);
-
-    if (builtin.os.tag == .windows) {
-        try std.testing.expect(prepared.uses_temp_file);
-        try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
-    } else {
-        try std.testing.expect(!prepared.uses_temp_file);
-        try std.testing.expectEqualStrings(body[0..], prepared.arg);
-    }
-}
-
-test "prepareCurlBodyArg spills large bodies to temp file" {
-    const allocator = std.testing.allocator;
-    const body = [_]u8{'x'} ** (MAX_INLINE_CURL_BODY_BYTES + 1);
-    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
-    defer prepared.deinit(allocator);
-
-    try std.testing.expect(prepared.uses_temp_file);
-    try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
 }
 
 test "appendCurlStallDetectionArgs appends curl speed flags in order" {

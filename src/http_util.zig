@@ -236,18 +236,27 @@ pub fn prepareCurlHeaderArg(allocator: Allocator, headers: []const []const u8) !
     var tmp_dir = std_compat.fs.openDirAbsolute(tmp_dir_path, .{}) catch return error.TempDirNotFound;
     defer tmp_dir.close();
 
-    const header_path = std.fmt.bufPrint(
-        &prepared.temp_path_buf,
-        "{s}{s}curl_headers_{d}.tmp",
-        .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.time.nanoTimestamp() },
-    ) catch return error.PathTooLong;
-    prepared.temp_path_len = header_path.len;
-    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
+    var tmp_file = blk: {
+        var attempt: u8 = 0;
+        while (attempt < 8) : (attempt += 1) {
+            const header_path = std.fmt.bufPrint(
+                &prepared.temp_path_buf,
+                "{s}{s}curl_headers_{x}.tmp",
+                .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.crypto.random.int(u64) },
+            ) catch return error.PathTooLong;
+            prepared.temp_path_len = header_path.len;
 
-    var tmp_file = tmp_dir.createFile(
-        header_path[tmp_dir_path.len + 1 ..],
-        .{ .truncate = true, .exclusive = false, .permissions = std_compat.fs.permissionsFromMode(0o600) },
-    ) catch return error.TempFileCreateFailed;
+            break :blk tmp_dir.createFile(
+                header_path[tmp_dir_path.len + 1 ..],
+                .{ .truncate = true, .exclusive = true, .permissions = std_compat.fs.permissionsFromMode(0o600) },
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return error.TempFileCreateFailed,
+            };
+        }
+        return error.TempFileCreateFailed;
+    };
+    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
 
     for (headers) |header| {
         validateCurlHeaderLine(header) catch {
