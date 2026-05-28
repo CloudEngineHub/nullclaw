@@ -1666,6 +1666,176 @@ test "credentialed curl args route to std http fallback" {
     try std.testing.expect(!hasCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"}));
 }
 
+const LegacyCredentialedCurlHelper = enum {
+    get_body,
+    get_status,
+    post_body,
+    post_status,
+    post_status_headers,
+    put_body,
+};
+
+const CredentialedCurlFallbackServerCtx = struct {
+    server: *std_compat.net.Server,
+    expected_method: []const u8,
+    saw_request: AtomicBool = AtomicBool.init(false),
+    saw_expected_method: AtomicBool = AtomicBool.init(false),
+    saw_authorization: AtomicBool = AtomicBool.init(false),
+};
+
+fn serveCredentialedCurlFallbackTest(ctx: *CredentialedCurlFallbackServerCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+
+    var buf: [2048]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = conn.stream.read(buf[filled..]) catch return;
+        if (n == 0) break;
+        filled += n;
+        if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+    }
+
+    const request = buf[0..filled];
+    ctx.saw_request.store(true, .release);
+    if (std.mem.startsWith(u8, request, ctx.expected_method) and
+        request.len > ctx.expected_method.len and
+        request[ctx.expected_method.len] == ' ')
+    {
+        ctx.saw_expected_method.store(true, .release);
+    }
+    if (std.mem.indexOf(u8, request, "Authorization: Bearer test-token") != null) {
+        ctx.saw_authorization.store(true, .release);
+    }
+
+    const response =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Content-Length: 11\r\n" ++
+        "Connection: close\r\n" ++
+        "\r\n" ++
+        "{\"ok\":true}";
+    conn.stream.writeAll(response) catch {};
+}
+
+fn unblockCredentialedCurlFallbackServer(server: *std_compat.net.Server) void {
+    var conn = std_compat.net.tcpConnectToAddress(server.listen_address) catch return;
+    conn.close();
+}
+
+fn expectLegacyCredentialedCurlFallback(helper: LegacyCredentialedCurlHelper, expected_method: []const u8) !void {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = CredentialedCurlFallbackServerCtx{
+        .server = &server,
+        .expected_method = expected_method,
+    };
+    var thread = try std.Thread.spawn(.{}, serveCredentialedCurlFallbackTest, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/legacy", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    const headers = [_][]const u8{"Authorization: Bearer test-token"};
+    var request_err: ?anyerror = null;
+
+    switch (helper) {
+        .get_body => {
+            const body = curlGet(allocator, url, &headers, "5") catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (body) |b| {
+                defer allocator.free(b);
+                try std.testing.expectEqualStrings("{\"ok\":true}", b);
+            }
+        },
+        .get_status => {
+            const resp = curlGetWithStatus(allocator, url, &headers) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (resp) |r| {
+                defer allocator.free(r.body);
+                try std.testing.expectEqual(@as(u16, 200), r.status_code);
+                try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+            }
+        },
+        .post_body => {
+            const body = curlPost(allocator, url, "{\"ping\":true}", &headers) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (body) |b| {
+                defer allocator.free(b);
+                try std.testing.expectEqualStrings("{\"ok\":true}", b);
+            }
+        },
+        .post_status => {
+            const resp = curlPostWithStatus(allocator, url, "{\"ping\":true}", &headers) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (resp) |r| {
+                defer allocator.free(r.body);
+                try std.testing.expectEqual(@as(u16, 200), r.status_code);
+                try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+            }
+        },
+        .post_status_headers => {
+            const resp = curlPostWithStatusHeadersAndTimeout(allocator, url, "{\"ping\":true}", &headers, null) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (resp) |r| {
+                defer allocator.free(r.headers);
+                defer allocator.free(r.body);
+                try std.testing.expectEqual(@as(u16, 200), r.status_code);
+                try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+            }
+        },
+        .put_body => {
+            const body = curlPut(allocator, url, "{\"ping\":true}", &headers) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (body) |b| {
+                defer allocator.free(b);
+                try std.testing.expectEqualStrings("{\"ok\":true}", b);
+            }
+        },
+    }
+
+    if (!ctx.saw_request.load(.acquire)) {
+        unblockCredentialedCurlFallbackServer(&server);
+    }
+    thread.join();
+
+    if (request_err) |err| return err;
+    try std.testing.expect(ctx.saw_expected_method.load(.acquire));
+    try std.testing.expect(ctx.saw_authorization.load(.acquire));
+}
+
+test "credentialed legacy curl body helpers do not reject authorization headers" {
+    // Regression: legacy channel code still passes Authorization to curl* helper
+    // APIs. These helpers must route through std.http fallback instead of
+    // returning CredentialedCurlArgRejected and breaking old channels.
+    try expectLegacyCredentialedCurlFallback(.get_body, "GET");
+    try expectLegacyCredentialedCurlFallback(.post_body, "POST");
+    try expectLegacyCredentialedCurlFallback(.put_body, "PUT");
+}
+
+test "credentialed legacy curl status helpers do not reject authorization headers" {
+    // Regression: status-returning helpers used by Lark/QQ/OneBot must preserve
+    // behavior while keeping Authorization out of curl argv.
+    try expectLegacyCredentialedCurlFallback(.get_status, "GET");
+    try expectLegacyCredentialedCurlFallback(.post_status, "POST");
+    try expectLegacyCredentialedCurlFallback(.post_status_headers, "POST");
+}
+
 test "prepareCurlHeaderArg writes headers outside argv" {
     var prepared = try prepareCurlHeaderArg(std.testing.allocator, &.{ "Authorization: Bearer test-token", "X-Test: ok" });
     defer prepared.deinit(std.testing.allocator);
