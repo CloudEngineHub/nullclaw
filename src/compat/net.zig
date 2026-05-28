@@ -397,7 +397,10 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
 }
 
 fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "localhost");
+    if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
+
+    const localhost_suffix = ".localhost";
+    return name.len > localhost_suffix.len and std.ascii.endsWithIgnoreCase(name, localhost_suffix);
 }
 
 fn mapWindowsLookupError(err: anyerror) GetAddressListError {
@@ -583,10 +586,14 @@ test "compat net oversized hostname fails fast" {
 test "compat net windows localhost fallback helper is scoped" {
     // Regression: Windows getAddressList used to return UnknownHostName for
     // every non-localhost hostname because this fallback short-circuited DNS.
+    // Keep the reserved .localhost zone local, but do not bypass DNS for
+    // unrelated hostnames.
     try std.testing.expect(shouldUseWindowsLocalhostFallback("localhost"));
     try std.testing.expect(shouldUseWindowsLocalhostFallback("LOCALHOST"));
-    try std.testing.expect(!shouldUseWindowsLocalhostFallback("foo.localhost"));
+    try std.testing.expect(shouldUseWindowsLocalhostFallback("foo.localhost"));
+    try std.testing.expect(shouldUseWindowsLocalhostFallback("FOO.LOCALHOST"));
     try std.testing.expect(!shouldUseWindowsLocalhostFallback("example.invalid"));
+    try std.testing.expect(!shouldUseWindowsLocalhostFallback("localhost.example"));
 }
 
 test "compat net windows lookup errors map to address list errors" {
@@ -778,13 +785,14 @@ fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
 
 // Regression: nullclaw/nullclaw#890 -- Windows getAddressList was a localhost-only
 // stub returning error.UnknownHostName for any name other than exact localhost.
-// The .localhost suffix is resolved locally by Zig's lookup path, so this avoids
-// live DNS while still exercising the non-fallback Windows resolver branch.
+// The .localhost suffix is reserved for loopback names, so resolve it locally
+// instead of relying on runner-specific Windows DNS behavior.
 test "compat net getAddressList resolves localhost subdomain on windows" {
     if (builtin.os.tag != .windows) return;
     const list = try getAddressList(std.testing.allocator, "foo.localhost", 443);
     defer list.deinit();
     try std.testing.expect(list.addrs.len > 0);
+    try std.testing.expect(list.addrs[0].any.family == posix.AF.INET);
 }
 
 // Regression: nullclaw/nullclaw#890 -- Windows getAddressList was a localhost-only stub.
