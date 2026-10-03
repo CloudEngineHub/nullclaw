@@ -236,19 +236,25 @@ pub const WsClient = struct {
         path: []const u8,
         extra_headers: []const []const u8,
     ) !WsClient {
-        const addr_list = try std_compat.net.getAddressList(allocator, host, port);
-        defer addr_list.deinit();
-        const stream = try connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
+        const stream = try connectTcp(allocator, host, port);
         errdefer stream.close();
+        return connectPlainFromStream(allocator, stream, host, path, extra_headers);
+    }
 
+    /// Complete a plain WebSocket handshake; on failure the caller retains the stream.
+    pub fn connectPlainFromStream(
+        allocator: std.mem.Allocator,
+        stream: std_compat.net.Stream,
+        host: []const u8,
+        path: []const u8,
+        extra_headers: []const []const u8,
+    ) !WsClient {
         var client = WsClient{
             .allocator = allocator,
             .stream = stream,
             .tls = null,
             .write_mu = .{},
         };
-        errdefer client.deinit();
-
         try client.performHandshake(host, path, extra_headers);
         return client;
     }
@@ -1334,4 +1340,19 @@ test "ws write_mu serializes concurrent frame writes" {
     client.write_mu.lock();
     defer client.write_mu.unlock();
     try std.testing.expect(client.write_mu.tryLock() == false);
+}
+
+// Regression: tracked sockets must remain caller-owned on plain handshake failure.
+test "connectPlainFromStream failure leaves stream owned by caller" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void) return error.SkipZigTest;
+    const sockets = try createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[0]);
+    defer std.Io.Threaded.closeFd(sockets[1]);
+    try writeAllFd(sockets[1], "HTTP/1.1");
+    try (std_compat.net.Stream{ .handle = sockets[1] }).shutdown(.send);
+    const stream = std_compat.net.Stream{ .handle = sockets[0] };
+    try std.testing.expectError(error.WsHandshakeFailed, WsClient.connectPlainFromStream(std.testing.allocator, stream, "example.com", "/", &.{}));
+    // A second write succeeds only if failure did not close the caller's socket.
+    try std.testing.expectEqual(@as(usize, 1), try stream.write("x"));
 }
