@@ -18,6 +18,9 @@
       "anthropic": {
         "api_key": "YOUR_ANTHROPIC_API_KEY"
       },
+      "edenai": {
+        "api_key": "YOUR_EDENAI_API_KEY"
+      },
       "azure": {
         "api_key": "YOUR_AZURE_OPENAI_API_KEY",
         "base_url": "https://your-resource.openai.azure.com"
@@ -91,6 +94,7 @@
   "memory": {
     "profile": "markdown_only",
     "backend": "markdown",
+    "database_path": "",
     "auto_save": true,
     "citations": "auto",
 

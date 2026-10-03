@@ -2573,6 +2573,21 @@ test "json parse memory weights accept integer values" {
     try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.search.query.hybrid.text_weight);
 }
 
+test "json parse memory database path" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"database_path":"/var/lib/nullclaw/dialogs.db"}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    defer allocator.free(cfg.memory.database_path);
+    try std.testing.expectEqualStrings("/var/lib/nullclaw/dialogs.db", cfg.memory.database_path);
+}
+
 test "json parse memory sqlite_ann store options" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2675,7 +2690,7 @@ test "save roundtrip preserves extended config sections" {
     };
 
     cfg.runtime.kind = "docker";
-    cfg.runtime.docker.image = "alpine:3.20";
+    cfg.runtime.docker.image = "example.com/nullclaw/runtime:test";
     cfg.runtime.docker.network = "bridge";
     cfg.runtime.docker.memory_limit_mb = 768;
     cfg.runtime.docker.read_only_rootfs = false;
@@ -2831,6 +2846,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", loaded.mcp_servers[0].env[0].key);
 
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
+    try std.testing.expectEqualStrings("example.com/nullclaw/runtime:test", loaded.runtime.docker.image);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expectEqual(@as(u32, 1500), loaded.messages.inbound.debounce_ms);

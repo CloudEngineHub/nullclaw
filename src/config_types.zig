@@ -302,7 +302,7 @@ pub const AutonomyConfig = struct {
 };
 
 pub const DockerRuntimeConfig = struct {
-    image: []const u8 = "alpine:3.20",
+    image: []const u8 = "alpine:3.24",
     network: []const u8 = "none",
     memory_limit_mb: ?u64 = 512,
     cpu_limit: ?f64 = 1.0,
@@ -1300,6 +1300,7 @@ pub const MemoryConfig = struct {
     /// Profile preset — convenience shortcut for common setups.
     profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    database_path: []const u8 = "",
     instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",
@@ -1880,7 +1881,7 @@ pub const McpServerConfig = struct {
     transport: []const u8 = DEFAULT_TRANSPORT,
     command: []const u8 = "",
     url: ?[]const u8 = null,
-    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    /// Per-request wall clock timeout for HTTP and stdio transports.
     timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
@@ -1967,6 +1968,12 @@ pub const SessionConfig = struct {
     /// Higher values enable parallel processing across different sessions.
     max_concurrent_tasks: u32 = 4,
 };
+
+// Regression: the default Docker runtime must not point at an unsupported Alpine branch.
+test "DockerRuntimeConfig defaults to supported pinned image" {
+    const cfg = DockerRuntimeConfig{};
+    try std.testing.expectEqualStrings("alpine:3.24", cfg.image);
+}
 
 test "WebConfig defaults" {
     const cfg = WebConfig{};
