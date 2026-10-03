@@ -262,8 +262,10 @@ pub const DeliveryOutbox = struct {
 
         const index = self.findJobIndexLocked(id) orelse return error.JobNotFound;
         var job = &self.jobs.items[index];
-        try job.replaceLastError(self.allocator, err_name);
+        // The send has finished even if allocating its diagnostic fails.
+        // Release the claim first so a transient OOM cannot strand the job.
         job.in_flight = false;
+        try job.replaceLastError(self.allocator, err_name);
         job.attempts += 1;
         job.next_attempt_ns = now_ns + retryBackoffNs(job.attempts);
         try self.saveLocked();
@@ -702,4 +704,34 @@ test "delivery outbox persists delivered acknowledgement across restart" {
 
     try std.testing.expectEqual(@as(usize, 1), try reopened.purgePersistedDelivered());
     try std.testing.expectEqual(@as(usize, 0), reopened.pendingCount());
+}
+
+// Regression: an OOM while recording a failed send must release the claim so
+// a recovered allocator can retry it without restarting the gateway.
+test "delivery outbox releases claim when recording failure runs out of memory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "outbox.json" });
+    defer allocator.free(path);
+    var outbox = try DeliveryOutbox.init(allocator, path);
+    defer outbox.deinit();
+    var msg = try bus.makeOutbound(allocator, "test", "chat-1", "hello");
+    defer msg.deinit(allocator);
+    const id = try outbox.enqueueFinal(msg);
+    outbox.jobs.items[0].last_error = try allocator.dupe(u8, "previous failure");
+    var claimed = (try outbox.claimNextReady(allocator, 0)).?;
+    defer claimed.deinit(allocator);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    outbox.allocator = failing.allocator();
+    const result = outbox.recordFailure(id, "new failure", 0);
+    outbox.allocator = allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqualStrings("previous failure", outbox.jobs.items[0].last_error.?);
+    var retried = (try outbox.claimNextReady(allocator, 0)) orelse return error.JobStillClaimed;
+    defer retried.deinit(allocator);
+    try std.testing.expectEqual(id, retried.id);
 }
