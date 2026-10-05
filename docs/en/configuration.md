@@ -93,12 +93,12 @@ The example below is enough to run local CLI mode (replace API key):
 - OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
 - `diagnostics.otel.endpoint` should use `https://...` for remote collectors. Plain `http://...` is accepted only for localhost/private collectors or container-local targets such as `host.docker.internal`, `host.containers.internal`, or single-label service names like `otel`.
 
-Logging flags (all default `false`; the `info`-level lines go to stderr — the terminal when running `nullclaw agent` interactively, or the daemon log file when running `nullclaw gateway`):
+Logging flags (all default `false`). The `info`-level lines go to stderr: the terminal when `nullclaw agent` or `nullclaw gateway` runs in the foreground. Getting them into a file is up to the service wrapper or your own redirection — service mode writes `~/.nullclaw/logs/daemon.stderr.log` (the launchd service config supplies it), while the `gateway` command itself does not route them to a daemon log file:
 
 - `log_tool_calls`: log each tool call with name, status, and duration. Tool arguments are included only when `log_llm_io` is also enabled.
 - `log_message_receipts`: log when a user message is received — metadata only (channel, session hash, size), never content.
-- `log_message_payloads`: log full inbound/outbound user-visible message content. Local debugging only — can include sensitive text.
-- `log_llm_io`: log provider request/response payloads around chat calls, including response and reasoning content. Local debugging only — can include sensitive text; keep off in production.
+- `log_message_payloads`: log a content preview of inbound/outbound user-visible messages — UTF-8-safe and capped at 4,096 bytes, marked `[log preview truncated]` when longer. Local debugging only — can include sensitive text.
+- `log_llm_io`: log redacted, truncated previews of provider request/response content around chat calls, including response and reasoning previews. Local debugging only — can include sensitive text; keep off in production.
 - `token_usage_ledger_enabled` (default `true`) plus `token_usage_ledger_window_hours` / `token_usage_ledger_max_bytes` / `token_usage_ledger_max_lines`: persist per-response token counters to a JSONL ledger near `config.json`. Token counts only — provider/model/prompt/completion/total — never message text.
 
 Example (production-safe: content-bearing flags off):
