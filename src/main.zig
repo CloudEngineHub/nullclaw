@@ -5496,6 +5496,11 @@ fn printAuthUsage() void {
         \\  --proxy <url>       HTTP proxy URL (e.g. http://localhost:7890)
         \\  --timeout <secs>    Login timeout in seconds (default: 300)
         \\
+        \\Weixin account selection:
+        \\  These commands take no account selector. With multiple accounts
+        \\  configured, the account is picked in this order: `default`, then
+        \\  `main`, then the lexicographically first account id.
+        \\
         \\Examples:
         \\  nullclaw auth login openai-codex
         \\  nullclaw auth login openai-codex --import-codex
