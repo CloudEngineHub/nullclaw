@@ -78,7 +78,15 @@ nullclaw onboard --interactive
 - OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
 - `diagnostics.otel.endpoint` 连接远程 collector 时应优先使用 `https://...`；`http://...` 仅适用于 localhost、私有网络 collector，或 `host.docker.internal`、`host.containers.internal`、`otel` 这类容器本地目标。
 
-示例：
+日志开关（默认均为 `false`）。这些 `info` 级别日志输出到 stderr —— `nullclaw agent` 或 `nullclaw gateway` 前台运行时直接打到终端；写入文件则由服务包装器或你自己的重定向负责：服务模式写入 `~/.nullclaw/logs/daemon.stderr.log`（launchd 服务配置会提供该文件），而 `gateway` 命令本身不会把这些日志路由到守护进程日志文件：
+
+- `log_tool_calls`：记录每次工具调用的名称、状态和耗时。工具参数只有在 `log_llm_io` 同时开启时才会记录。
+- `log_message_receipts`：记录收到用户消息的事件 —— 仅元数据（渠道、会话哈希、大小），不含内容。
+- `log_message_payloads`：记录入站/出站用户可见消息的内容预览 —— UTF-8 安全、上限 4,096 字节，超出时标记 `[log preview truncated]`。仅用于本地调试 —— 可能包含敏感文本。
+- `log_llm_io`：记录聊天调用提供方请求/响应的脱敏、截断预览，包括回复与推理（reasoning）内容的预览。仅用于本地调试 —— 可能包含敏感文本；生产环境请保持关闭。
+- `token_usage_ledger_enabled`（默认 `true`）以及 `token_usage_ledger_window_hours` / `token_usage_ledger_max_bytes` / `token_usage_ledger_max_lines`：将每次响应的 token 计数持久化到 config.json 附近的 JSONL 台账。仅记录 token 数量（提供方/模型/prompt/completion/total），绝不记录消息文本。
+
+示例（生产安全配置：涉及内容的开关均关闭）：
 
 ```json
 {
@@ -86,8 +94,8 @@ nullclaw onboard --interactive
     "backend": "otel",
     "log_tool_calls": true,
     "log_message_receipts": true,
-    "log_message_payloads": true,
-    "log_llm_io": true,
+    "log_message_payloads": false,
+    "log_llm_io": false,
     "otel": {
       "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
